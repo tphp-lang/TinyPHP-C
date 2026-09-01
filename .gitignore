@@ -1,0 +1,22 @@
+# ai
+
+# 编译产物
+/tcc
+build/
+*.exe
+*.def
+*.dll
+*.so
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# composer
+/vendor
+composer.lock
+
+# 日记
+*.log

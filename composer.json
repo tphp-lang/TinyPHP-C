@@ -1,0 +1,14 @@
+{
+    "name": "tphplang/tinyphp",
+    "type": "project",
+    "license": "MIT",
+    "description": "TinyPHP 一个 PHP AOT 编译器。将 强类型 PHP 子集代码转译为人类可读 C 代码，再行编译。",
+    "require": {
+        "php": ">=8.4"
+    },
+    "autoload": {
+        "psr-4": {
+            "Tphp\\": "src"
+        }
+    }
+}

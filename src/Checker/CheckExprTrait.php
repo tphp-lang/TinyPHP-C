@@ -1,0 +1,1003 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Tphp\Checker;
+
+use Tphp\Ast\Expr;
+use Tphp\Ast\expr\CCallExpr;
+use Tphp\Ast\expr\CConstExpr;
+use Tphp\Ast\expr\ArrayLit;
+use Tphp\Ast\expr\AssignExpr;
+use Tphp\Ast\expr\BinaryExpr;
+use Tphp\Ast\expr\BoolLit;
+use Tphp\Ast\expr\CallExpr;
+use Tphp\Ast\expr\CastExpr;
+use Tphp\Ast\expr\FloatLit;
+use Tphp\Ast\expr\IndexExpr;
+use Tphp\Ast\expr\IntLit;
+use Tphp\Ast\expr\InterpStr;
+use Tphp\Ast\expr\MethodCall;
+use Tphp\Ast\expr\NameExpr;
+use Tphp\Ast\expr\NewExpr;
+use Tphp\Ast\expr\NullLit;
+use Tphp\Ast\expr\PostfixExpr;
+use Tphp\Ast\expr\OrExpr;
+use Tphp\Ast\expr\PropFetch;
+use Tphp\Ast\expr\StaticCall;
+use Tphp\Ast\expr\StaticConst;
+use Tphp\Ast\expr\StaticProp;
+use Tphp\Ast\expr\StrLit;
+use Tphp\Ast\expr\TernaryExpr;
+use Tphp\Ast\expr\ThisExpr;
+use Tphp\Ast\expr\UnaryExpr;
+use Tphp\Ast\expr\VarExpr;
+use Tphp\Table\ClassSymbol;
+use Tphp\Table\ConstSymbol;
+use Tphp\Table\FnSymbol;
+use Tphp\Table\InterfaceSymbol;
+use Tphp\Table\Scope;
+use Tphp\Table\TypeKind;
+use Tphp\Table\VarSymbol;
+use Tphp\Token\Pos;
+use Tphp\Ast\stmt\BreakStmt;
+use Tphp\Ast\stmt\ContinueStmt;
+use Tphp\Ast\stmt\ExprStmt;
+use Tphp\Ast\stmt\ReturnStmt;
+use Tphp\Type\Type;
+use Tphp\Token\TokenKind;
+
+/** 表达式检查：自底向上推导类型，回填到节点。 */
+trait CheckExprTrait
+{
+    private function checkExpr(Expr $e): int
+    {
+        $t = $this->doCheckExpr($e);
+        $e->type = $t;
+        return $t;
+    }
+
+    private function doCheckExpr(Expr $e): int
+    {
+        if ($e instanceof IntLit) {
+            return Type::I_INT;
+        }
+        if ($e instanceof FloatLit) {
+            return Type::I_DOUBLE;
+        }
+        if ($e instanceof BoolLit) {
+            return Type::I_BOOL;
+        }
+        if ($e instanceof NullLit) {
+            return Type::I_NULL;
+        }
+        if ($e instanceof StrLit) {
+            return Type::I_STRING;
+        }
+        if ($e instanceof InterpStr) {
+            return $this->checkInterpStr($e);
+        }
+        if ($e instanceof VarExpr) {
+            return $this->checkVar($e);
+        }
+        if ($e instanceof ThisExpr) {
+            if ($this->curFn === null || !$this->curFn->isMethod || $this->curFn->isStatic) {
+                $this->error('$this 只能在实例方法中使用', $e->pos);
+                return Type::NONE;
+            }
+            return $this->curFn->ownerClass->code;
+        }
+        if ($e instanceof ArrayLit) {
+            return $this->checkArrayLit($e);
+        }
+        if ($e instanceof IndexExpr) {
+            return $this->checkIndex($e);
+        }
+        if ($e instanceof BinaryExpr) {
+            return $this->checkBinary($e);
+        }
+        if ($e instanceof UnaryExpr) {
+            return $this->checkUnary($e);
+        }
+        if ($e instanceof PostfixExpr) {
+            return $this->checkIncDec($e->expr, $e, $e->op);
+        }
+        if ($e instanceof TernaryExpr) {
+            $this->requireBool($e->cond, '三元表达式条件');
+            $tt = $this->checkExpr($e->then);
+            $et = $this->checkExpr($e->else);
+            $common = $this->commonType($tt, $et);
+            if ($common === Type::NONE) {
+                $this->error(
+                    '三元表达式两个分支类型不一致：'
+                    . $this->table->displayName($tt) . ' 与 ' . $this->table->displayName($et),
+                    $e->pos,
+                );
+            }
+            return $common;
+        }
+        if ($e instanceof AssignExpr) {
+            return $this->checkAssign($e);
+        }
+        if ($e instanceof CallExpr) {
+            return $this->checkCall($e);
+        }
+        if ($e instanceof NewExpr) {
+            return $this->checkNew($e);
+        }
+        if ($e instanceof PropFetch) {
+            return $this->resolveProp($e);
+        }
+        if ($e instanceof MethodCall) {
+            return $this->checkMethodCall($e);
+        }
+        if ($e instanceof StaticCall) {
+            return $this->checkStaticCall($e);
+        }
+        if ($e instanceof StaticProp) {
+            return $this->checkStaticProp($e);
+        }
+        if ($e instanceof CastExpr) {
+            return $this->checkCast($e);
+        }
+        if ($e instanceof NameExpr) {
+            return $this->checkName($e);
+        }
+        if ($e instanceof OrExpr) {
+            return $this->checkOr($e);
+        }
+        if ($e instanceof CCallExpr) {
+            return $this->checkCCall($e);
+        }
+        if ($e instanceof CConstExpr) {
+            $e->type = Type::I_CVAL;
+            return Type::I_CVAL;
+        }
+        if ($e instanceof StaticConst) {
+            return $this->checkStaticConst($e);
+        }
+        return Type::NONE;
+    }
+
+    // ------------------------------------------------------------------ 基础
+
+    /** 裸名字：函数内常量 → 全局常量（Ns\name 未命中时回退全局 name，PHP 语义）。 */
+    private function checkName(NameExpr $e): int
+    {
+        $local = $this->scope->findConst($e->name);
+        if ($local !== null) {
+            $e->isLocal = true;
+            return $local->type;
+        }
+        $global = $this->table->consts[$e->name] ?? null;
+        if ($global === null && str_contains($e->name, '\\')) {
+            $short = substr($e->name, strrpos($e->name, '\\') + 1);
+            if (isset($this->table->consts[$short])) {
+                $e->name = $short; // 全局回退
+                $global = $this->table->consts[$short];
+            }
+        }
+        if ($global !== null) {
+            $e->isLocal = false;
+            return $global->type;
+        }
+        $this->error("未定义的名字 '{$e->name}'", $e->pos);
+        return Type::NONE;
+    }
+
+    /**
+     * f() or { ... }：错误时执行块。
+     * 值上下文要求块以表达式语句结尾（或以 return/break/continue 终止）。
+     */
+    private function checkOr(OrExpr $e): int
+    {
+        $ret = $this->checkExpr($e->call);
+
+        $saved = $this->scope;
+        $this->scope = new Scope($saved, $saved->fn);
+        $this->scope->consts['err'] = new ConstSymbol('err', Type::I_STRING, null, pos: $e->pos);
+        $this->checkStmts($e->block);
+
+        if (!$this->table->isVoid($ret)) {
+            $last = $e->block === [] ? null : $e->block[count($e->block) - 1];
+            if ($last instanceof ReturnStmt || $last instanceof BreakStmt || $last instanceof ContinueStmt) {
+                // 块终止，不提供值
+            } elseif ($last instanceof ExprStmt) {
+                $vt = $last->expr->type;
+                if (!$this->assignableExpr($ret, $last->expr)) {
+                    $this->error(
+                        'or 块结果类型不匹配：期望 ' . $this->table->displayName($ret)
+                        . '，得到 ' . $this->table->displayName($vt) . $this->narrowHint($ret, $vt),
+                        $e->pos,
+                    );
+                }
+            } else {
+                $this->error('or 块必须以表达式结尾以提供返回值', $e->pos);
+            }
+        }
+        $this->scope = $saved;
+        return $ret;
+    }
+
+    /** c-> 调用：参数必须是 C 侧值（string 需先 c_str()），返回 CVAL。 */
+    private function checkCCall(CCallExpr $e): int
+    {
+        foreach ($e->args as $arg) {
+            $t = $this->checkExpr($arg);
+            if (!$this->isCArgType($t)) {
+                $hint = $this->table->isString($t) ? '（string 需先经 c_str() 转换）' : '';
+                $this->error(
+                    'c-> 调用的参数必须是 C 侧值，得到 ' . $this->table->displayName($t) . $hint,
+                    $arg->pos,
+                );
+            }
+        }
+        return Type::I_CVAL;
+    }
+
+    /** c-> 调用可接受的实参类型。 */
+    private function isCArgType(int $t): bool
+    {
+        return $t === Type::I_INT || $t === Type::I_FLOAT || $t === Type::I_DOUBLE
+            || $t === Type::I_BOOL || $t === Type::I_CVAL || $t === Type::I_NULL
+            || $t === ($this->table->findNamed('c.ptr') ?? -1)
+            || $this->table->isIntLike($t) || $this->table->isFloatLike($t)
+            || $this->table->isCStruct($t) || $this->table->isCPointer($t);
+    }
+
+    private function checkStaticConst(StaticConst $e): int
+    {
+        $class = $this->resolveStaticClass($e->class);
+        if ($class === null) {
+            return Type::NONE;
+        }
+        $const = $class->findConst($e->name);
+        if ($const === null) {
+            $this->error("类 {$class->name} 没有常量 {$e->name}", $e->pos);
+            return Type::NONE;
+        }
+        if (!$this->canAccess($const->owner, $const->vis)) {
+            $this->error("无法访问 {$const->owner->name} 的 {$const->vis} 常量 {$e->name}", $e->pos);
+            return Type::NONE;
+        }
+        return $const->type;
+    }
+
+    private function checkVar(VarExpr $e): int
+    {
+        $sym = $this->scope->find($e->name);
+        if ($sym === null) {
+            $this->error("未定义的变量 \${$e->name}", $e->pos);
+            return Type::NONE;
+        }
+        return $sym->type;
+    }
+
+    private function checkInterpStr(InterpStr $e): int
+    {
+        foreach ($e->parts as $part) {
+            if (is_string($part)) {
+                continue;
+            }
+            $t = $this->checkExpr($part);
+            if (!$this->table->isScalar($t)) {
+                $this->error(
+                    '插值表达式必须是标量（得到 ' . $this->table->displayName($t) . '）',
+                    $part->pos,
+                );
+            }
+        }
+        return Type::I_STRING;
+    }
+
+    private function checkArrayLit(ArrayLit $e): int
+    {
+        if ($e->items === []) {
+            return Type::I_ARRAY; // 空数组：借赋值目标的元素类型
+        }
+        $t = $this->checkExpr($e->items[0]);
+        for ($i = 1; $i < count($e->items); $i++) {
+            $et = $this->checkExpr($e->items[$i]);
+            $common = $this->commonType($t, $et);
+            if ($common === Type::NONE) {
+                $this->error(
+                    '数组元素类型不一致：' . $this->table->displayName($t)
+                    . ' 与 ' . $this->table->displayName($et),
+                    $e->items[$i]->pos,
+                );
+                return Type::NONE;
+            }
+            $t = $common;
+        }
+        return $this->table->arrayOf($t);
+    }
+
+    /** 数组字面量按目标元素类型做上下文检查（new Cat(...) → array<Animal>）。 */
+    private function checkArrayLitAgainst(ArrayLit $e, int $elem): void
+    {
+        foreach ($e->items as $item) {
+            $t = $this->checkExpr($item);
+            if (!$this->assignableExpr($elem, $item)) {
+                $this->error(
+                    '数组元素类型不匹配：期望 ' . $this->table->displayName($elem)
+                    . '，得到 ' . $this->table->displayName($t) . $this->narrowHint($elem, $t),
+                    $item->pos,
+                );
+            }
+        }
+    }
+
+    private function checkIndex(IndexExpr $e): int
+    {
+        $base = $this->checkExpr($e->base);
+        if ($this->table->isString($base)) {
+            if ($e->index === null) {
+                $this->error('字符串不可变，不能追加写', $e->pos);
+                return Type::NONE;
+            }
+            $this->requireIntLike($e->index, '字符串下标');
+            return Type::I_STRING;
+        }
+        if ($this->table->isArray($base)) {
+            if ($e->index === null) {
+                $this->error('数组追加写（$a[] = v）只能作为赋值目标', $e->pos);
+                return Type::NONE;
+            }
+            $this->requireIntLike($e->index, '数组下标');
+            return $this->table->arrayElemOf($base);
+        }
+        $this->error(
+            $e->index === null
+                ? '只有数组可以追加写'
+                : $this->table->displayName($base) . ' 类型不支持下标访问',
+            $e->pos,
+        );
+        return Type::NONE;
+    }
+
+    // ------------------------------------------------------------------ 运算
+
+    private function checkBinary(BinaryExpr $e): int
+    {
+        $op = $e->op;
+        $lt = $this->checkExpr($e->left);
+        $rt = $this->checkExpr($e->right);
+        $table = $this->table;
+
+        switch ($op) {
+            case TokenKind::Pow:
+                if ($lt === Type::I_INT && $rt === Type::I_INT) {
+                    return Type::I_INT;
+                }
+                if ($table->isNumeric($lt) && $table->isNumeric($rt)) {
+                    return Type::I_DOUBLE;
+                }
+                $this->error('幂运算只支持 int 与浮点类型', $e->pos);
+                return Type::NONE;
+
+            case TokenKind::Plus:
+            case TokenKind::Minus:
+            case TokenKind::Star:
+            case TokenKind::Slash:
+                if ($lt === Type::I_STRING || $rt === Type::I_STRING) {
+                    $this->error('字符串拼接请使用 . 运算符', $e->pos);
+                    return Type::NONE;
+                }
+                return $this->requireNumericPair($lt, $rt, $e->pos);
+
+            case TokenKind::Percent:
+                if ($table->isIntLike($lt) && $table->isIntLike($rt)) {
+                    return $this->numericPromote($lt, $rt);
+                }
+                $this->error('取模运算只支持整数类型', $e->pos);
+                return Type::NONE;
+
+            case TokenKind::Dot:
+                if ($table->isScalar($lt) && $table->isScalar($rt)) {
+                    return Type::I_STRING;
+                }
+                $this->error('拼接只支持标量与字符串', $e->pos);
+                return Type::NONE;
+
+            case TokenKind::EqEq:
+            case TokenKind::NotEq:
+                if ($this->comparable($lt, $rt)) {
+                    return Type::I_BOOL;
+                }
+                $this->error(
+                    $this->table->displayName($lt) . ' 与 '
+                    . $this->table->displayName($rt) . ' 不可比较',
+                    $e->pos,
+                );
+                return Type::NONE;
+
+            case TokenKind::Lt:
+            case TokenKind::Gt:
+            case TokenKind::LtEq:
+            case TokenKind::GtEq:
+                if ($this->orderable($lt, $rt)) {
+                    return Type::I_BOOL;
+                }
+                $this->error('关系比较只支持数值与字符串', $e->pos);
+                return Type::NONE;
+
+            case TokenKind::AndAnd:
+            case TokenKind::OrOr:
+                if ($table->isBool($lt) && $table->isBool($rt)) {
+                    return Type::I_BOOL;
+                }
+                $this->error('逻辑运算只支持 bool', $e->pos);
+                return Type::NONE;
+
+            case TokenKind::Amp:
+            case TokenKind::Pipe:
+            case TokenKind::Caret:
+            case TokenKind::Shl:
+            case TokenKind::Shr:
+                if ($table->isIntLike($lt) && $table->isIntLike($rt)) {
+                    return $this->numericPromote($lt, $rt);
+                }
+                $this->error('位运算只支持整数类型', $e->pos);
+                return Type::NONE;
+
+            default:
+                $this->error('不支持的运算符', $e->pos);
+                return Type::NONE;
+        }
+    }
+
+    private function requireNumericPair(int $lt, int $rt, ?Pos $pos): int
+    {
+        // CVAL 混入算术：结果 CVAL（生成 C 原样）
+        if ($lt === Type::I_CVAL || $rt === Type::I_CVAL) {
+            return Type::I_CVAL;
+        }
+        if ($lt === Type::I_BOOL || $rt === Type::I_BOOL) {
+            $this->error('bool 不参与算术运算', $pos);
+            return Type::NONE;
+        }
+        if (!$this->table->isNumeric($lt) || !$this->table->isNumeric($rt)) {
+            $this->error(
+                $this->table->displayName($lt) . ' 与 '
+                . $this->table->displayName($rt) . ' 不能做算术运算',
+                $pos,
+            );
+            return Type::NONE;
+        }
+        $p = $this->numericPromote($lt, $rt);
+        if ($p === Type::NONE) {
+            $this->error('两个不同的 c.* 整型运算需要显式强转', $pos);
+        }
+        return $p;
+    }
+
+    private function checkUnary(UnaryExpr $e): int
+    {
+        switch ($e->op) {
+            case TokenKind::Minus:
+            case TokenKind::Plus:
+                $t = $this->checkExpr($e->expr);
+                if (!$this->table->isNumeric($t) || $t === Type::I_BOOL) {
+                    $this->error('一元 +/- 只支持数值类型', $e->pos);
+                    return Type::NONE;
+                }
+                return $t;
+            case TokenKind::Not:
+                $t = $this->checkExpr($e->expr);
+                if (!$this->table->isBool($t)) {
+                    $this->error('! 需要 bool 操作数', $e->pos);
+                    return Type::NONE;
+                }
+                return Type::I_BOOL;
+            case TokenKind::Tilde:
+                $t = $this->checkExpr($e->expr);
+                if (!$this->table->isIntLike($t)) {
+                    $this->error('~ 只支持整数类型', $e->pos);
+                    return Type::NONE;
+                }
+                return $t;
+            default:
+                return $this->checkIncDec($e->expr, $e, $e->op);
+        }
+    }
+
+    private function checkIncDec(Expr $operand, Expr $node, TokenKind $op): int
+    {
+        $t = $this->checkExpr($operand);
+        if (!$this->table->isNumeric($t) || $t === Type::I_BOOL) {
+            $this->error('自增自减只支持数值变量', $node->pos);
+            return Type::NONE;
+        }
+        if (!$operand instanceof VarExpr && !$operand instanceof PropFetch
+            && !$operand instanceof StaticProp && !$operand instanceof IndexExpr) {
+            $this->error('自增自减的操作数必须是变量', $node->pos);
+            return Type::NONE;
+        }
+        return $t;
+    }
+
+    // ------------------------------------------------------------------ 赋值
+
+    private function checkAssign(AssignExpr $e): int
+    {
+        $target = $e->target;
+
+        // 未定义变量的首次赋值 = 类型推断声明（PHP 类型；C 类型必须显式声明）
+        if ($e->op === TokenKind::Eq && $target instanceof VarExpr
+            && $this->scope->find($target->name) === null
+            && $this->scope->findConst($target->name) === null) {
+            return $this->inferDeclare($e);
+        }
+
+        $targetType = $this->resolveAssignTarget($target, $e->op !== TokenKind::Eq);
+
+        if ($e->op === TokenKind::Eq) {
+            if ($e->value instanceof ArrayLit && $this->table->isArray($targetType)) {
+                // 数组字面量借目标元素类型做上下文检查
+                if (!$this->checkArrayLitAgainst($e->value, $this->table->arrayElemOf($targetType))) {
+                    $e->value->type = $targetType;
+                }
+            } else {
+                $vt = $this->checkExpr($e->value);
+                $this->warnSelfCycle($target, $e->value);
+                if ($targetType !== Type::NONE && !$this->assignableExpr($targetType, $e->value)) {
+                    $this->error(
+                        '赋值类型不匹配：期望 ' . $this->table->displayName($targetType)
+                        . '，得到 ' . $this->table->displayName($vt) . $this->narrowHint($targetType, $vt),
+                        $e->value->pos,
+                    );
+                }
+            }
+            return $targetType;
+        }
+
+        $vt = $this->checkExpr($e->value);
+        if ($targetType === Type::NONE) {
+            return Type::NONE;
+        }
+        $common = match ($e->op) {
+            TokenKind::PlusEq, TokenKind::MinusEq, TokenKind::StarEq, TokenKind::SlashEq, TokenKind::PercentEq =>
+                $this->requireNumericPair($targetType, $vt, $e->pos),
+            TokenKind::DotEq => $this->table->isString($targetType) && $this->table->isScalar($vt)
+                ? Type::I_STRING
+                : Type::NONE,
+            TokenKind::AmpEq, TokenKind::PipeEq, TokenKind::CaretEq, TokenKind::ShlEq, TokenKind::ShrEq =>
+                ($this->table->isIntLike($targetType) && $this->table->isIntLike($vt))
+                    ? $this->numericPromote($targetType, $vt)
+                    : Type::NONE,
+            TokenKind::PowEq => ($targetType === Type::I_INT && $vt === Type::I_INT)
+                ? Type::I_INT
+                : (($this->table->isNumeric($targetType) && $this->table->isNumeric($vt)) ? Type::I_DOUBLE : Type::NONE),
+            default => Type::NONE,
+        };
+        if ($common === Type::NONE || !$this->assignable($targetType, $common)) {
+            $this->error(
+                "复合赋值运算符与目标类型 {$this->table->displayName($targetType)} 不匹配"
+                . $this->narrowHint($targetType, $common),
+                $e->pos,
+            );
+            return $targetType;
+        }
+        return $targetType;
+    }
+
+    /**
+     * 首次赋值推断声明：$x = expr; → 类型由值推断并定死。
+     * C 侧类型（c.* / cstruct / CVAL）禁止推断——必须显式声明。
+     */
+    private function inferDeclare(AssignExpr $e): int
+    {
+        $target = $e->target;
+        if ($e->value instanceof ArrayLit && $e->value->items === []) {
+            $this->error(
+                '空数组无法推断元素类型，请显式声明：array<T> $' . $target->name . ' = []',
+                $e->pos,
+            );
+            return Type::NONE;
+        }
+        $vt = $this->checkExpr($e->value);
+        if ($vt === Type::NONE || $vt === Type::I_ARRAY) {
+            return Type::NONE; // 值检查已报错 / 裸数组
+        }
+        if ($this->isCValue($vt)) {
+            $this->error(
+                'C 类型必须显式声明（如 c.i32 $' . $target->name . ' = ...），不允许推断',
+                $e->pos,
+            );
+            return Type::NONE;
+        }
+        $this->scope->vars[$target->name] = new VarSymbol($target->name, $vt, $e->pos);
+        return $vt;
+    }
+
+    /** 是否 C 侧值（禁止推断）：c.* 别名 / c.ptr / cstruct / CVAL。 */
+    private function isCValue(int $type): bool
+    {
+        return $this->table->kindOf($type) === TypeKind::Ctype
+            || $this->table->kindOf($type) === TypeKind::CStruct
+            || $this->table->kindOf($type) === TypeKind::CPointer
+            || $type === Type::I_CVAL;
+    }
+
+    /** 解析赋值目标类型。$forWrite=true 时下标必须有索引。 */
+    private function resolveAssignTarget(Expr $t, bool $forWrite): int
+    {
+        if ($t instanceof VarExpr) {
+            $sym = $this->scope->find($t->name);
+            if ($sym === null) {
+                $this->error("未定义的变量 \${$t->name}", $t->pos);
+                return Type::NONE;
+            }
+            return $sym->type;
+        }
+
+        if ($t instanceof IndexExpr) {
+            $base = $this->checkExpr($t->base);
+            if ($this->table->isString($base)) {
+                $this->error('字符串不可变，不能下标赋值', $t->pos);
+                return Type::NONE;
+            }
+            if (!$this->table->isArray($base)) {
+                $this->error($this->table->displayName($base) . ' 类型不能下标赋值', $t->pos);
+                return Type::NONE;
+            }
+            if ($t->index === null) {
+                return $this->table->arrayElemOf($base); // $a[] = v
+            }
+            $this->requireIntLike($t->index, '数组下标');
+            return $this->table->arrayElemOf($base);
+        }
+
+        if ($t instanceof PropFetch) {
+            return $this->resolveProp($t);
+        }
+
+        if ($t instanceof StaticProp) {
+            return $this->resolveStaticProp($t);
+        }
+
+        $this->error('无效的赋值目标', $t->pos);
+        return Type::NONE;
+    }
+
+    private function resolveProp(PropFetch $e): int
+    {
+        $ot = $this->checkExpr($e->obj);
+
+        // cstruct 值字段访问：$v->field（生成 C 点访问）
+        if ($this->table->isCStruct($ot)) {
+            return $this->resolveCStructField($this->table->cstructs[$this->table->displayName($ot)] ?? null, $e, $ot);
+        }
+        // C 指针字段访问：$p->field（生成 C 箭头 + 空指针 panic）
+        if ($this->table->isCPointer($ot)) {
+            $baseName = rtrim($this->table->displayName($ot), '*');
+            $baseCode = $this->table->findNamed($baseName)
+                ?? ($this->table->cstructs[$baseName]->code ?? null);
+            if ($baseCode === null || !$this->table->isCStruct($baseCode)) {
+                $this->error("指针类型 {$this->table->displayName($ot)} 不支持字段访问（仅 cstruct 指针可以）", $e->pos);
+                return Type::NONE;
+            }
+            return $this->resolveCStructField($this->table->cstructs[$baseName] ?? null, $e, $ot);
+        }
+
+        if (!$this->table->isClass($ot)) {
+            $this->error(
+                $this->table->displayName($ot) . ' 类型没有属性 $' . $e->name,
+                $e->pos,
+            );
+            return Type::NONE;
+        }
+        $class = $this->table->classByCode($ot);
+        $prop = $class->findProp($e->name);
+        if ($prop === null) {
+            $this->error("类 {$class->name} 没有属性 \${$e->name}", $e->pos);
+            return Type::NONE;
+        }
+        if ($prop->isStatic) {
+            $this->error("静态属性请用 {$class->name}::\${$e->name} 访问", $e->pos);
+            return Type::NONE;
+        }
+        if (!$this->canAccess($prop->owner, $prop->vis)) {
+            $this->error("无法访问 {$prop->owner->name} 的 {$prop->vis} 属性 \${$e->name}", $e->pos);
+            return Type::NONE;
+        }
+        return $prop->type;
+    }
+
+    /** cstruct 字段查找。 */
+    private function resolveCStructField(?\Tphp\Table\CStructSymbol $struct, PropFetch $e, int $recvType): int
+    {
+        if ($struct === null) {
+            $this->error("未知 cstruct", $e->pos);
+            return Type::NONE;
+        }
+        foreach ($struct->resolvedFields as $field) {
+            if ($field['name'] === $e->name) {
+                return $field['type'];
+            }
+        }
+        $this->error("cstruct {$struct->name} 没有字段 {$e->name}", $e->pos);
+        return Type::NONE;
+    }
+
+    private function resolveStaticClass(string $name): ?ClassSymbol
+    {
+        if ($name === 'self') {
+            if ($this->curClass === null) {
+                $this->error('self:: 只能在类中使用', null);
+                return null;
+            }
+            return $this->curClass;
+        }
+        if ($name === 'parent') {
+            if ($this->curClass?->parent === null) {
+                $this->error('当前类没有父类，不能用 parent::', null);
+                return null;
+            }
+            return $this->curClass->parent;
+        }
+        $class = $this->table->classes[$name] ?? null;
+        if ($class === null) {
+            $this->error("未定义的类 '{$name}'", null);
+        }
+        return $class;
+    }
+
+    private function checkStaticProp(StaticProp $e): int
+    {
+        return $this->resolveStaticProp($e);
+    }
+
+    private function resolveStaticProp(StaticProp $e): int
+    {
+        $class = $this->resolveStaticClass($e->class);
+        if ($class === null) {
+            return Type::NONE;
+        }
+        $prop = $class->findProp($e->name);
+        if ($prop === null) {
+            $this->error("类 {$class->name} 没有属性 \${$e->name}", $e->pos);
+            return Type::NONE;
+        }
+        if (!$prop->isStatic) {
+            $this->error("实例属性请用 ->\${$e->name} 访问", $e->pos);
+            return Type::NONE;
+        }
+        if (!$this->canAccess($prop->owner, $prop->vis)) {
+            $this->error("无法访问 {$prop->owner->name} 的 {$prop->vis} 属性 \${$e->name}", $e->pos);
+            return Type::NONE;
+        }
+        return $prop->type;
+    }
+
+    // ------------------------------------------------------------------ 调用
+
+    private function checkCall(CallExpr $e): int
+    {
+        $fn = $this->table->fns[$e->name] ?? null;
+        if ($fn === null && str_contains($e->name, '\\')) {
+            // 全局回退（PHP 语义）：Ns\name 未命中时尝试全局 name
+            $short = substr($e->name, strrpos($e->name, '\\') + 1);
+            if (isset($this->table->fns[$short])) {
+                $e->name = $short;
+                $fn = $this->table->fns[$short];
+            }
+        }
+        if ($fn === null) {
+            $this->error("未定义的函数 '{$e->name}()'", $e->pos);
+            return Type::NONE;
+        }
+        if ($fn->isBuiltin) {
+            return $this->checkBuiltinCall($fn, $e);
+        }
+        $this->checkArgs($fn, $e->args, $e->pos);
+        return $fn->ret;
+    }
+
+    private function checkBuiltinCall(FnSymbol $fn, CallExpr $e): int
+    {
+        // phpc 桥接：string ↔ char* + C 内存所有权
+        if ($fn->name === 'c_str' || $fn->name === 'php_str' || $fn->name === 'php_str_ref'
+            || $fn->name === 'c_own' || $fn->name === 'cbuf') {
+            if (count($e->args) !== 1) {
+                $this->error("{$fn->name}() 只接受一个参数", $e->pos);
+                return Type::NONE;
+            }
+            $t = $this->checkExpr($e->args[0]);
+            if ($fn->name === 'c_str') {
+                if (!$this->table->isString($t)) {
+                    $this->error('c_str() 需要 string 参数', $e->pos);
+                }
+                return $this->table->pointerOf('c.char', $this->table->findNamed('c.char'));
+            }
+            if ($fn->name === 'php_str' || $fn->name === 'php_str_ref') {
+                // char* / c.ptr(void*) / null / CVAL → string
+                if (!$this->table->isCPointer($t) && $t !== Type::I_CVAL
+                    && $t !== Type::I_NULL && $t !== $this->table->findNamed('c.ptr')) {
+                    $this->error("{$fn->name}() 需要 char* 指针参数（c-> 调用返回值或 c.char*）", $e->pos);
+                }
+                return Type::I_STRING;
+            }
+            // cbuf(n) / c_own(p)：返回 CVAL（已登记所有权，函数出口自动 free）
+            if ($fn->name === 'cbuf') {
+                if (!$this->table->isIntLike($t) && $t !== Type::I_CVAL) {
+                    $this->error('cbuf() 需要整数长度参数', $e->pos);
+                }
+            } elseif (!$this->table->isCPointer($t) && $t !== Type::I_CVAL && $t !== Type::I_NULL) {
+                $this->error('c_own() 需要指针参数（c-> 调用返回值）', $e->pos);
+            }
+            return Type::I_CVAL;
+        }
+
+        if (count($e->args) !== 1) {
+            $this->error("{$fn->name}() 只接受一个参数", $e->pos);
+            foreach ($e->args as $arg) {
+                $this->checkExpr($arg);
+            }
+            return $fn->name === 'len' ? Type::I_INT : Type::I_VOID;
+        }
+        $t = $this->checkExpr($e->args[0]);
+        if ($fn->name === 'len') {
+            if (!$this->table->isString($t) && !$this->table->isArray($t)) {
+                $this->error('len() 只支持 string 与 array', $e->pos);
+            }
+            return Type::I_INT;
+        }
+        return Type::I_VOID; // dump
+    }
+
+    private function checkArgs(FnSymbol $fn, array $args, ?Pos $pos): void
+    {
+        $n = count($args);
+        if ($n > count($fn->params)) {
+            $this->error("'{$fn->name}()' 参数过多", $pos);
+        }
+        foreach ($fn->params as $i => $param) {
+            if ($i < $n) {
+                $at = $this->checkExpr($args[$i]);
+                if (!$this->assignableExpr($param->type, $args[$i])) {
+                    $this->error(
+                        "'{$fn->name}()' 第 " . ($i + 1) . " 个参数类型不匹配：期望 "
+                        . $this->table->displayName($param->type) . '，得到 '
+                        . $this->table->displayName($at) . $this->narrowHint($param->type, $at),
+                        $args[$i]->pos,
+                    );
+                }
+            } elseif (!$param->hasDefault) {
+                $this->error("'{$fn->name}()' 缺少参数 \${$param->name}", $pos);
+            }
+        }
+    }
+
+    private function checkNew(NewExpr $e): int
+    {
+        if (isset($this->table->ifaces[$e->class])) {
+            $this->error("接口 '{$e->class}' 不能实例化", $e->pos);
+            return Type::NONE;
+        }
+        $class = $this->table->classes[$e->class] ?? null;
+        if ($class === null) {
+            $this->error("未定义的类 '{$e->class}'", $e->pos);
+            return Type::NONE;
+        }
+        $ctor = $class->findMethod('__construct'); // 子类可继承父类构造器
+        if ($ctor !== null) {
+            if (!$this->canAccess($ctor->ownerClass, $ctor->vis)) {
+                $this->error("类 {$class->name} 的构造器不可访问", $e->pos);
+            }
+            $this->checkArgs($ctor, $e->args, $e->pos);
+        } elseif ($e->args !== []) {
+            $this->error("类 {$class->name} 没有 __construct，不能传参数", $e->pos);
+        }
+        return $class->code;
+    }
+
+    private function checkMethodCall(MethodCall $e): int
+    {
+        $ot = $this->checkExpr($e->obj);
+
+        // 接口上的方法调用（itab 分发）
+        if ($this->table->isInterface($ot)) {
+            $iface = $this->table->interfaceByCode($ot);
+            $sig = $iface->findMethod($e->name);
+            if ($sig === null) {
+                $this->error("接口 {$iface->name} 没有方法 {$e->name}()", $e->pos);
+                foreach ($e->args as $arg) {
+                    $this->checkExpr($arg);
+                }
+                return Type::NONE;
+            }
+            $this->checkArgs($sig, $e->args, $e->pos);
+            return $sig->ret;
+        }
+
+        if (!$this->table->isClass($ot)) {
+            $this->error(
+                $this->table->displayName($ot) . ' 类型不能调用方法 ->' . $e->name . '()',
+                $e->pos,
+            );
+            foreach ($e->args as $arg) {
+                $this->checkExpr($arg);
+            }
+            return Type::NONE;
+        }
+        $class = $this->table->classByCode($ot);
+        $fn = $class->findMethod($e->name);
+        if ($fn === null) {
+            $this->error("类 {$class->name} 没有方法 {$e->name}()", $e->pos);
+            foreach ($e->args as $arg) {
+                $this->checkExpr($arg);
+            }
+            return Type::NONE;
+        }
+        if ($fn->isStatic) {
+            $this->error("静态方法请用 {$class->name}::{$e->name}() 调用", $e->pos);
+        }
+        if (!$this->canAccess($fn->ownerClass, $fn->vis)) {
+            $this->error("无法访问 {$fn->ownerClass->name} 的 {$fn->vis} 方法 {$e->name}()", $e->pos);
+        }
+        $this->checkArgs($fn, $e->args, $e->pos);
+        return $fn->ret;
+    }
+
+    private function checkStaticCall(StaticCall $e): int
+    {
+        $class = $this->resolveStaticClass($e->class);
+        if ($class === null) {
+            foreach ($e->args as $arg) {
+                $this->checkExpr($arg);
+            }
+            return Type::NONE;
+        }
+        $fn = $class->findMethod($e->method);
+        if ($fn === null) {
+            $this->error("类 {$class->name} 没有方法 {$e->method}()", $e->pos);
+            foreach ($e->args as $arg) {
+                $this->checkExpr($arg);
+            }
+            return Type::NONE;
+        }
+        if (!$fn->isStatic && !$fn->isCtor) {
+            $this->error("不能用 :: 调用实例方法，请使用 ->{$e->method}()", $e->pos);
+        }
+        if (!$this->canAccess($fn->ownerClass, $fn->vis)) {
+            $this->error("无法访问 {$fn->ownerClass->name} 的 {$fn->vis} 方法 {$e->method}()", $e->pos);
+        }
+        $this->checkArgs($fn, $e->args, $e->pos);
+        return $fn->ret;
+    }
+
+    private function checkCast(CastExpr $e): int
+    {
+        $target = $this->resolveTypeRef($e->target);
+        $src = $this->checkExpr($e->expr);
+        if ($target === Type::NONE) {
+            return Type::NONE;
+        }
+        if ($this->table->isVoid($target)) {
+            $this->error('不能强转为 void', $e->pos);
+            return Type::NONE;
+        }
+        if (!$this->allowedCast($target, $src)) {
+            $this->error(
+                '不能把 ' . $this->table->displayName($src)
+                . ' 强转为 ' . $this->table->displayName($target),
+                $e->pos,
+            );
+            return Type::NONE;
+        }
+        return $target;
+    }
+
+    private function requireIntLike(Expr $e, string $what): void
+    {
+        $t = $this->checkExpr($e);
+        // CVAL 允许作下标（信任程序员）
+        if (!$this->table->isIntLike($t) && $t !== Type::I_CVAL) {
+            $this->error(
+                "{$what}必须是整数类型（得到 " . $this->table->displayName($t) . '）',
+                $e->pos,
+            );
+        }
+    }
+}
