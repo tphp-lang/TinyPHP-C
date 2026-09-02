@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tphp\Parser;
 
 use Tphp\Ast\Expr;
+use Tphp\Ast\stmt\ReturnStmt;
 use Tphp\Ast\expr\CCallExpr;
 use Tphp\Ast\expr\CConstExpr;
 use Tphp\Ast\expr\ArrayLit;
@@ -13,15 +14,18 @@ use Tphp\Ast\expr\BinaryExpr;
 use Tphp\Ast\expr\BoolLit;
 use Tphp\Ast\expr\CallExpr;
 use Tphp\Ast\expr\CastExpr;
+use Tphp\Ast\expr\ClosureExpr;
 use Tphp\Ast\expr\FloatLit;
 use Tphp\Ast\expr\IndexExpr;
 use Tphp\Ast\expr\IntLit;
 use Tphp\Ast\expr\InterpStr;
+use Tphp\Ast\expr\InvokeExpr;
 use Tphp\Ast\expr\MethodCall;
 use Tphp\Ast\expr\NameExpr;
 use Tphp\Ast\expr\NewExpr;
 use Tphp\Ast\expr\NullLit;
 use Tphp\Ast\expr\OrExpr;
+use Tphp\Ast\expr\PlaceholderExpr;
 use Tphp\Ast\expr\PostfixExpr;
 use Tphp\Ast\expr\PropFetch;
 use Tphp\Ast\expr\StaticCall;
@@ -52,6 +56,9 @@ trait ParserExprTrait
         TokenKind::AmpEq, TokenKind::PipeEq, TokenKind::CaretEq, TokenKind::ShlEq,
         TokenKind::ShrEq,
     ];
+
+    /** 管道右值解析深度：>0 时调用参数中的 ... 是占位符。 */
+    private int $pipeRhsDepth = 0;
 
     public function parseExpr(): Expr
     {
@@ -88,7 +95,9 @@ trait ParserExprTrait
     {
         $left = $this->parseTernary();
         while ($this->match(TokenKind::PipeRight)) {
+            $this->pipeRhsDepth++;
             $rhs = $this->parseTernary();
+            $this->pipeRhsDepth--;
             $left = $this->at($this->pipeInto($rhs, $left), $left->pos);
         }
         return $left;
@@ -101,19 +110,47 @@ trait ParserExprTrait
             return new OrExpr($this->pipeInto($rhs->call, $piped), $rhs->block);
         }
         if ($rhs instanceof CallExpr) {
-            return new CallExpr($rhs->name, [$piped, ...$rhs->args]);
+            return new CallExpr($rhs->name, $this->pipeFill($rhs->args, $piped));
         }
         if ($rhs instanceof MethodCall && $this->isSimpleReceiver($rhs->obj)) {
-            return new MethodCall($rhs->obj, $rhs->name, [$piped, ...$rhs->args]);
+            return new MethodCall($rhs->obj, $rhs->name, $this->pipeFill($rhs->args, $piped));
         }
         if ($rhs instanceof StaticCall) {
-            return new StaticCall($rhs->class, $rhs->method, [$piped, ...$rhs->args]);
+            return new StaticCall($rhs->class, $rhs->method, $this->pipeFill($rhs->args, $piped));
         }
         if ($rhs instanceof CCallExpr) {
-            return new CCallExpr($rhs->name, [$piped, ...$rhs->args]);
+            return new CCallExpr($rhs->name, $this->pipeFill($rhs->args, $piped));
+        }
+        if ($rhs instanceof InvokeExpr && $rhs->callee instanceof VarExpr) {
+            return new InvokeExpr($rhs->callee, $this->pipeFill($rhs->args, $piped));
+        }
+        if ($rhs instanceof ClosureExpr) {
+            return new InvokeExpr($rhs, [$piped]); // x |> (fn...) = 以 x 调用闭包
         }
         $this->errHere('「|>」右侧必须是函数调用、方法调用或静态调用');
         return $rhs;
+    }
+
+    /** 管道实参填充：... 占位符处插入左值（仅一次）；无占位符时默认插入首参。 */
+    private function pipeFill(array $args, Expr $piped): array
+    {
+        $out = [];
+        $filled = false;
+        foreach ($args as $a) {
+            if ($a instanceof PlaceholderExpr) {
+                if ($filled) {
+                    $this->errHere('「|>」占位符 ... 在一次管道中只能出现一次');
+                }
+                $out[] = $piped;
+                $filled = true;
+            } else {
+                $out[] = $a;
+            }
+        }
+        if (!$filled) {
+            array_unshift($out, $piped);
+        }
+        return $out;
     }
 
     /** 管道方法接收者不得嵌套调用，避免管道值被求值两次。 */
@@ -221,9 +258,9 @@ trait ParserExprTrait
                 $e = $this->at(new PostfixExpr($kind, $e), $e->pos);
                 continue;
             }
-            // f() or { ... }：仅函数调用可带错误处理块
+            // f() or { ... } / $f() or { ... }：调用可带错误处理块
             if ($kind === TokenKind::KwOr && $this->peekKindAt(1) === TokenKind::Lbrace
-                && $e instanceof CallExpr) {
+                && ($e instanceof CallExpr || $e instanceof InvokeExpr)) {
                 $this->next(); // or
                 $block = $this->parseBracedBlock();
                 $e = $this->at(new OrExpr($e, $block), $e->pos);
@@ -235,6 +272,24 @@ trait ParserExprTrait
                 $e = $this->at(new CallExpr($e->name, $args), $e->pos);
                 continue;
             }
+            // $f(args)：callable 变量调用
+            if ($kind === TokenKind::Lparen && $e instanceof VarExpr) {
+                $this->next();
+                $args = $this->parseArgs();
+                $e = $this->at(new InvokeExpr($e, $args), $e->pos);
+                continue;
+            }
+            // f(...)：一等可调用 → fn(arg0) => f(arg0)（签名 Checker 从函数表推导）
+            if ($kind === TokenKind::Ellipsis && $e instanceof NameExpr) {
+                $this->next();
+                $arg0 = new Param(new TypeRef('<adapter>'), 'arg0');
+                $call = new CallExpr($e->name, [new VarExpr('arg0')]);
+                $rs = new ReturnStmt($call);
+                $c = new ClosureExpr([$arg0], null, [$rs], [], false);
+                $c->adapterOf = $e->name;
+                $e = $this->at($c, $e->pos);
+                continue;
+            }
             if ($kind === TokenKind::DoubleColon && $e instanceof NameExpr) {
                 $this->next();
                 $e = $this->parseStaticAccess($e->name, $e->pos);
@@ -242,6 +297,47 @@ trait ParserExprTrait
             }
             return $e;
         }
+    }
+
+    /** 闭包：function (params) [use ($a, &$b)] [: T] { body }。 */
+    private function parseClosure(): ClosureExpr
+    {
+        $pos = $this->peek()->pos;
+        $this->expect(TokenKind::KwFunction, "'function'");
+        $params = $this->parseParamList();
+        $captures = [];
+        if ($this->match(TokenKind::KwUse)) {
+            $this->expect(TokenKind::Lparen, "'('");
+            if (!$this->is(TokenKind::Rparen)) {
+                do {
+                    $byRef = $this->match(TokenKind::Amp);
+                    $name = substr($this->expect(TokenKind::Var, '捕获变量名')->lit, 1);
+                    $captures[] = ['name' => $name, 'byRef' => $byRef];
+                } while ($this->match(TokenKind::Comma));
+            }
+            $this->expect(TokenKind::Rparen, "')'");
+        }
+        $ret = $this->match(TokenKind::Colon) ? $this->parseTypeRef() : null;
+        $body = $this->parseBracedBlock();
+        return $this->at(new ClosureExpr($params, $ret, $body, $captures), $pos);
+    }
+
+    /** 箭头闭包：fn (params) [: T] => expr | { body }（自动按值捕获自由变量）。 */
+    private function parseArrowFn(): ClosureExpr
+    {
+        $pos = $this->peek()->pos;
+        $this->expect(TokenKind::KwFn, "'fn'");
+        $params = $this->parseParamList();
+        $ret = $this->match(TokenKind::Colon) ? $this->parseTypeRef() : null;
+        $this->expect(TokenKind::FatArrow, "'=>'");
+        if ($this->is(TokenKind::Lbrace)) {
+            $body = $this->parseBracedBlock(); // 块体：须自带 return（Checker 校验）
+            return $this->at(new ClosureExpr($params, $ret, $body, [], true), $pos);
+        }
+        $expr = $this->parseTernary();
+        $rs = new ReturnStmt($expr);
+        $rs->pos = $expr->pos;
+        return $this->at(new ClosureExpr($params, $ret, [$rs], [], true), $pos);
     }
 
     private function parseStaticAccess(string $class, ?Pos $pos): Expr
@@ -265,7 +361,18 @@ trait ParserExprTrait
         $args = [];
         if (!$this->is(TokenKind::Rparen)) {
             while (true) {
-                $args[] = $this->parseExpr();
+                if ($this->is(TokenKind::Ellipsis)) {
+                    $t = $this->next();
+                    if ($this->pipeRhsDepth === 0) {
+                        $this->errHere('「...」占位符只能在管道 |> 右侧的调用参数中使用');
+                    }
+                    if (!$this->is(TokenKind::Comma) && !$this->is(TokenKind::Rparen)) {
+                        $this->errHere('「...」占位符后只能是 "," 或 ")"');
+                    }
+                    $args[] = $this->at(new PlaceholderExpr(), $t->pos);
+                } else {
+                    $args[] = $this->parseExpr();
+                }
                 if (!$this->match(TokenKind::Comma)) {
                     break;
                 }
@@ -307,6 +414,10 @@ trait ParserExprTrait
             case TokenKind::KwThis:
                 $this->next();
                 return $this->at(new ThisExpr(), $t->pos);
+            case TokenKind::KwFunction:
+                return $this->parseClosure();
+            case TokenKind::KwFn:
+                return $this->parseArrowFn();
             case TokenKind::Ident:
                 $this->next();
                 // c-> 前缀：直连 C 函数调用 / C 常量引用

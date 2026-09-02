@@ -166,6 +166,18 @@ trait GenStmtTrait
         $this->rcStmtBegin();
         $target = $e->target;
         if ($e->op === TokenKind::Eq && $target instanceof \Tphp\Ast\expr\VarExpr
+            && $e->boxedDecl) {
+            // 引用捕获变量的推断声明：落地为堆盒子，赋值经解引用（doc/closure.md §3.5）
+            $lv = Names::localVar($target->name);
+            foreach ($this->genBoxDecl($target->name, $e->type) as $line) {
+                $this->w($line);
+            }
+            $this->rcDeclareLocal($lv, $e->type, true);
+            $this->w($this->rcAssignText('(*' . $lv . '_box)', $e->type, $this->genExpr($e->value), $this->isFreshProducer($e->value)) . ';');
+            $this->rcStmtEnd();
+            return;
+        }
+        if ($e->op === TokenKind::Eq && $target instanceof \Tphp\Ast\expr\VarExpr
             && $this->rcScopeFind(Names::localVar($target->name)) === null) {
             // 推断声明的 C 落地
             $lv = Names::localVar($target->name);
@@ -187,6 +199,18 @@ trait GenStmtTrait
     private function genLocalDecl(LocalDecl $s): void
     {
         $type = $s->varType;
+        $name = Names::localVar($s->name);
+        if ($s->boxed) {
+            // 引用捕获变量：存储提升为堆盒子（doc/closure.md §3.5）
+            foreach ($this->genBoxDecl($s->name, $type) as $line) {
+                $this->w($line);
+            }
+            $this->rcDeclareLocal($name, $type, true);
+            if ($s->init !== null) {
+                $this->w($this->rcAssignText('(*' . $name . '_box)', $type, $this->genExpr($s->init), $this->isFreshProducer($s->init)) . ';');
+            }
+            return;
+        }
         $init = $s->init !== null ? $this->genExpr($s->init) : $this->zeroValue($type);
         // 类类型的向上转型：显式 C 指针转型
         if ($s->init !== null && $this->table->isClass($type)
@@ -238,6 +262,9 @@ trait GenStmtTrait
         } elseif ($heap && !($s->expr instanceof NullLit)
             && ($s->expr instanceof PropFetch || $s->expr instanceof IndexExpr)) {
             // 返回借用（字段/元素）：调用方需要自己的引用
+            $this->rcRefStmt($text, $s->expr->type);
+        } elseif ($heap && $s->expr instanceof \Tphp\Ast\expr\ThisExpr) {
+            // 返回 $this（: self 链式）：借用 incref——调用方持有自己的引用
             $this->rcRefStmt($text, $s->expr->type);
         }
         $this->rcCleanupReturn();

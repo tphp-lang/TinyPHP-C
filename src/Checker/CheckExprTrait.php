@@ -13,10 +13,12 @@ use Tphp\Ast\expr\BinaryExpr;
 use Tphp\Ast\expr\BoolLit;
 use Tphp\Ast\expr\CallExpr;
 use Tphp\Ast\expr\CastExpr;
+use Tphp\Ast\expr\ClosureExpr;
 use Tphp\Ast\expr\FloatLit;
 use Tphp\Ast\expr\IndexExpr;
 use Tphp\Ast\expr\IntLit;
 use Tphp\Ast\expr\InterpStr;
+use Tphp\Ast\expr\InvokeExpr;
 use Tphp\Ast\expr\MethodCall;
 use Tphp\Ast\expr\NameExpr;
 use Tphp\Ast\expr\NewExpr;
@@ -36,6 +38,7 @@ use Tphp\Table\ClassSymbol;
 use Tphp\Table\ConstSymbol;
 use Tphp\Table\FnSymbol;
 use Tphp\Table\InterfaceSymbol;
+use Tphp\Table\ParamSymbol;
 use Tphp\Table\Scope;
 use Tphp\Table\TypeKind;
 use Tphp\Table\VarSymbol;
@@ -156,6 +159,12 @@ trait CheckExprTrait
         if ($e instanceof StaticConst) {
             return $this->checkStaticConst($e);
         }
+        if ($e instanceof ClosureExpr) {
+            return $this->checkClosure($e);
+        }
+        if ($e instanceof InvokeExpr) {
+            return $this->checkInvoke($e);
+        }
         return Type::NONE;
     }
 
@@ -270,7 +279,211 @@ trait CheckExprTrait
             $this->error("未定义的变量 \${$e->name}", $e->pos);
             return Type::NONE;
         }
+        $this->gateClosureVar($e->name, $e->pos);
+        $e->sym = $sym;
         return $sym->type;
+    }
+
+    /**
+     * 闭包体变量访问门（doc/closure.md §3.7）：
+     * 箭头闭包自动按值捕获"直接外层函数/闭包"的变量；function 闭包必须显式 use。
+     * 跨越闭包边界的传递捕获报错。
+     */
+    private function gateClosureVar(string $name, Pos $pos): void
+    {
+        if ($this->closureCtx === []) {
+            return;
+        }
+        $ctx = $this->closureCtx[count($this->closureCtx) - 1];
+        if (isset($ctx['scope']->vars[$name])) {
+            return; // 已是本闭包的捕获 / 参数 / 局部
+        }
+        $owner = $this->findOwnerScope($name);
+        if ($owner === null) {
+            return; // 未定义：由调用方报错
+        }
+        if ($owner->fn !== $ctx['containerFn']) {
+            $this->error('嵌套闭包只能捕获直接外层函数/闭包的变量', $pos);
+            return;
+        }
+        if (!$ctx['auto']) {
+            $this->error("闭包体内的变量 \${$name} 必须 use (...) 捕获", $pos);
+            return;
+        }
+        $sym = $owner->vars[$name];
+        $ctx['node']->resolvedCaptures[] = ['name' => $name, 'byRef' => false, 'type' => $sym->type, 'boxed' => $sym->boxed];
+        $vs = new VarSymbol($name, $sym->type, $pos);
+        $vs->isCapture = true;
+        $ctx['scope']->vars[$name] = $vs;
+    }
+
+    private function findOwnerScope(string $name): ?Scope
+    {
+        for ($s = $this->scope; $s !== null; $s = $s->parent) {
+            if (isset($s->vars[$name])) {
+                return $s;
+            }
+        }
+        return null;
+    }
+
+    // ------------------------------------------------------------------ 闭包与调用
+
+    private function checkClosure(ClosureExpr $e): int
+    {
+        $paramTypes = [];
+        $closureFn = new FnSymbol('%closure', $e->pos);
+        if ($e->adapterOf !== null) {
+            // f(...) 一等可调用适配器：签名 = 被引用函数（单参适配）
+            $target = $this->table->fns[$e->adapterOf] ?? null;
+            if ($target === null) {
+                $this->error("未定义的函数 '{$e->adapterOf}()'", $e->pos);
+                $e->sig = ['ret' => Type::NONE, 'params' => []];
+                return Type::I_CALLABLE;
+            }
+            if (count($target->params) !== 1) {
+                $this->error("'{$e->adapterOf}(...)' 一等可调用只支持单参数函数（得到 "
+                    . count($target->params) . ' 个）', $e->pos);
+            }
+            $pt = $target->params[0]->type;
+            $paramTypes = [$pt];
+            $closureFn->params[] = new ParamSymbol($pt, 'arg0', false, null, $e->pos);
+            $closureFn->ret = $target->ret;
+        }
+        foreach ($e->params as $p) {
+            if ($e->adapterOf !== null) {
+                break; // 适配器参数来自函数签名
+            }
+            $t = $this->resolveTypeRef($p->typeRef);
+            if ($t === Type::NONE || $t === Type::I_VOID) {
+                $this->error('闭包参数类型无效', $p->pos);
+            }
+            $paramTypes[] = $t;
+            $closureFn->params[] = new ParamSymbol($t, $p->name, $p->hasDefault, $p->default, $p->pos);
+        }
+
+        // 捕获列表：类型取自创建点作用域；byRef 标记外层变量为盒子存储
+        $resolved = [];
+        foreach ($e->captures as $c) {
+            $sym = $this->scope->find($c['name']);
+            if ($sym === null) {
+                $this->error("捕获变量 \${$c['name']} 不存在", $e->pos);
+                continue;
+            }
+            if ($c['byRef']) {
+                if ($this->closureDepth > 0 || $sym->isCapture) {
+                    $this->error('引用捕获的变量必须是直接外层函数的局部变量/参数', $e->pos);
+                } else {
+                    $sym->boxed = true;
+                }
+            }
+            $resolved[] = ['name' => $c['name'], 'byRef' => $c['byRef'], 'type' => $sym->type, 'boxed' => $sym->boxed];
+        }
+        foreach ($e->params as $p) {
+            foreach ($resolved as $c) {
+                if ($c['name'] === $p->name) {
+                    $this->error("捕获变量 \${$p->name} 与闭包参数同名", $p->pos);
+                }
+            }
+        }
+        $e->resolvedCaptures = $resolved;
+
+        $ret = $e->ret !== null ? $this->resolveTypeRef($e->ret) : Type::NONE;
+        if ($ret === Type::NONE && !$e->isArrow) {
+            $ret = Type::I_VOID; // 块体闭包省略返回类型 = void
+        }
+        $closureFn->ret = $ret;
+
+        // 闭包体：独立作用域（穿透查外层由 gateClosureVar 把关）+ 独立函数上下文
+        $savedScope = $this->scope;
+        $savedFn = $this->curFn;
+        $scope = new Scope($savedScope, $closureFn);
+        foreach ($resolved as $c) {
+            $vs = new VarSymbol($c['name'], $c['type'], $e->pos);
+            $vs->isCapture = true;
+            $scope->vars[$c['name']] = $vs;
+        }
+        foreach ($closureFn->params as $ps) {
+            $scope->vars[$ps->name] = new VarSymbol($ps->name, $ps->type, $ps->pos);
+        }
+        $this->scope = $scope;
+        $this->curFn = $closureFn;
+        $this->closureCtx[] = ['auto' => $e->isArrow, 'scope' => $scope, 'node' => $e, 'containerFn' => $savedFn];
+        $this->closureDepth++;
+        $this->checkStmts($e->body);
+        $this->closureDepth--;
+        array_pop($this->closureCtx);
+        $this->scope = $savedScope;
+        $this->curFn = $savedFn;
+
+        $ret = $closureFn->ret;
+        if ($ret === Type::NONE) {
+            $ret = Type::I_VOID; // 箭头闭包体无 return
+        }
+        $e->sig = ['ret' => $ret, 'params' => $paramTypes];
+        return Type::I_CALLABLE; // 闭包表达式的静态类型；签名经节点 sig 传递
+    }
+
+    private function checkInvoke(InvokeExpr $e): int
+    {
+        // 闭包字面量直接调用（管道右侧 (fn...) 等）：签名在节点上
+        if ($e->callee instanceof ClosureExpr) {
+            $this->checkExpr($e->callee); // 先检查闭包（填充 sig / 捕获）
+            $sig = $e->callee->sig;
+            if ($sig === null) {
+                return Type::NONE;
+            }
+            $e->sig = $sig;
+            $n = count($e->args);
+            if ($n > count($sig['params'])) {
+                $this->error('闭包调用参数过多', $e->pos);
+            }
+            foreach ($sig['params'] as $i => $pt) {
+                if ($i < $n) {
+                    $at = $this->checkExpr($e->args[$i]);
+                    if (!$this->assignableExpr($pt, $e->args[$i])) {
+                        $this->error('闭包调用第 ' . ($i + 1) . ' 个参数类型不匹配：期望 '
+                            . $this->table->displayName($pt) . '，得到 '
+                            . $this->table->displayName($at), $e->args[$i]->pos);
+                    }
+                } else {
+                    $this->error('闭包调用缺少第 ' . ($i + 1) . ' 个参数', $e->pos);
+                }
+            }
+            return $sig['ret'];
+        }
+        $name = $e->callee instanceof VarExpr ? $e->callee->name : '';
+        $sym = $name !== '' ? $this->scope->find($name) : null;
+        if ($sym === null || $sym->closureSig === null) {
+            $this->error("变量 \${$name} 不可调用（需赋值闭包以推导签名）", $e->pos);
+            foreach ($e->args as $arg) {
+                $this->checkExpr($arg);
+            }
+            return Type::NONE;
+        }
+        $this->gateClosureVar($name, $e->pos);
+        if ($sym->closureSig === null) {
+            return Type::NONE; // gate 已报错
+        }
+        $sig = $sym->closureSig;
+        $e->sig = $sig;
+        $n = count($e->args);
+        if ($n > count($sig['params'])) {
+            $this->error('闭包调用参数过多', $e->pos);
+        }
+        foreach ($sig['params'] as $i => $pt) {
+            if ($i < $n) {
+                $at = $this->checkExpr($e->args[$i]);
+                if (!$this->assignableExpr($pt, $e->args[$i])) {
+                    $this->error('闭包调用第 ' . ($i + 1) . ' 个参数类型不匹配：期望 '
+                        . $this->table->displayName($pt) . '，得到 '
+                        . $this->table->displayName($at), $e->args[$i]->pos);
+                }
+            } else {
+                $this->error('闭包调用缺少第 ' . ($i + 1) . ' 个参数', $e->pos);
+            }
+        }
+        return $sig['ret'];
     }
 
     private function checkInterpStr(InterpStr $e): int
@@ -547,6 +760,24 @@ trait CheckExprTrait
                         $e->value->pos,
                     );
                 }
+                if ($e->value instanceof ClosureExpr && $target instanceof VarExpr) {
+                    $tsym = $this->scope->find($target->name);
+                    if ($tsym !== null) {
+                        $tsym->closureSig = $e->value->sig;
+                    }
+                } elseif ($e->value instanceof CallExpr && $e->value->retClosureSig !== null
+                    && $target instanceof VarExpr) {
+                    $tsym = $this->scope->find($target->name);
+                    if ($tsym !== null) {
+                        $tsym->closureSig = $e->value->retClosureSig;
+                    }
+                } elseif ($e->value instanceof VarExpr && $target instanceof VarExpr) {
+                    $ssym = $this->scope->find($e->value->name);
+                    $tsym = $this->scope->find($target->name);
+                    if ($ssym?->closureSig !== null && $tsym !== null) {
+                        $tsym->closureSig = $ssym->closureSig;
+                    }
+                }
             }
             return $targetType;
         }
@@ -606,7 +837,22 @@ trait CheckExprTrait
             );
             return Type::NONE;
         }
-        $this->scope->vars[$target->name] = new VarSymbol($target->name, $vt, $e->pos);
+        $vs = new VarSymbol($target->name, $vt, $e->pos);
+        if ($e->value instanceof ClosureExpr) {
+            $vs->closureSig = $e->value->sig;
+        } elseif ($e->value instanceof CallExpr && $e->value->retClosureSig !== null) {
+            $vs->closureSig = $e->value->retClosureSig;
+        } elseif ($e->value instanceof VarExpr) {
+            $ssym = $this->scope->find($e->value->name);
+            if ($ssym !== null) {
+                $vs->closureSig = $ssym->closureSig;
+            }
+        }
+        if (isset($this->boxedNames[$target->name])) {
+            $vs->boxed = true;
+            $e->boxedDecl = true;
+        }
+        $this->scope->vars[$target->name] = $vs;
         return $vt;
     }
 
@@ -628,6 +874,8 @@ trait CheckExprTrait
                 $this->error("未定义的变量 \${$t->name}", $t->pos);
                 return Type::NONE;
             }
+            $this->gateClosureVar($t->name, $t->pos);
+            $t->sym = $sym;
             return $sym->type;
         }
 
@@ -791,6 +1039,9 @@ trait CheckExprTrait
             return $this->checkBuiltinCall($fn, $e);
         }
         $this->checkArgs($fn, $e->args, $e->pos);
+        if ($fn->retClosureSig !== null && $this->table->isCallable($fn->ret)) {
+            $e->retClosureSig = $fn->retClosureSig; // 签名挂节点供 $f(...) 推导；静态类型仍是 callable
+        }
         return $fn->ret;
     }
 
@@ -798,12 +1049,24 @@ trait CheckExprTrait
     {
         // phpc 桥接：string ↔ char* + C 内存所有权
         if ($fn->name === 'c_str' || $fn->name === 'php_str' || $fn->name === 'php_str_ref'
-            || $fn->name === 'c_own' || $fn->name === 'cbuf') {
+            || $fn->name === 'c_own' || $fn->name === 'cbuf' || $fn->name === 'c_fn') {
             if (count($e->args) !== 1) {
                 $this->error("{$fn->name}() 只接受一个参数", $e->pos);
                 return Type::NONE;
             }
             $t = $this->checkExpr($e->args[0]);
+            if ($fn->name === 'c_fn') {
+                // c_fn($closure)：闭包 → C 回调函数指针（CVAL；约定 C 回调尾参 void* userdata）
+                $arg = $e->args[0];
+                $sig = $arg instanceof ClosureExpr ? $arg->sig
+                    : ($arg instanceof VarExpr ? ($this->scope->find($arg->name)?->closureSig) : null);
+                if ($sig === null) {
+                    $this->error('c_fn() 需要闭包字面量或已赋值闭包的变量（签名可推导）', $e->pos);
+                } else {
+                    $e->closureSig = $sig;
+                }
+                return Type::I_CVAL;
+            }
             if ($fn->name === 'c_str') {
                 if (!$this->table->isString($t)) {
                     $this->error('c_str() 需要 string 参数', $e->pos);
@@ -862,6 +1125,21 @@ trait CheckExprTrait
                         . $this->table->displayName($at) . $this->narrowHint($param->type, $at),
                         $args[$i]->pos,
                     );
+                }
+                // callable 形参：闭包实参的签名流入形参（函数体内 $f(...) 按此校验）
+                if ($this->table->isCallable($param->type)) {
+                    $argSig = null;
+                    if ($args[$i] instanceof ClosureExpr) {
+                        $argSig = $args[$i]->sig;
+                    } elseif ($args[$i] instanceof VarExpr) {
+                        $ssym = $this->scope->find($args[$i]->name);
+                        $argSig = $ssym?->closureSig;
+                    } elseif ($args[$i] instanceof CallExpr) {
+                        $argSig = $args[$i]->retClosureSig;
+                    }
+                    if ($argSig !== null) {
+                        $param->closureSig = $argSig;
+                    }
                 }
             } elseif (!$param->hasDefault) {
                 $this->error("'{$fn->name}()' 缺少参数 \${$param->name}", $pos);

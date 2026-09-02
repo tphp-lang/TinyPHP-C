@@ -8,7 +8,7 @@
 | string | String | 不可变值类型；SSO ≤23 字节内联，超限走 bump 池 |
 | bool | bool | true/false |
 | array\<T\> | Array* | 泛型数组（引用类型，见下文） |
-| callable | Callable | 闭包/C 函数指针（v0.1 仅支持静态函数引用与 null） |
+| callable | Callable | 闭包 / C 函数指针（双字 {fn, env}；env 为捕获环境，doc/closure.md） |
 | void | void | 没有值的数据类型，通常用于函数返回值 |
 | 类类型 | tphp_class_X* | 编译期单态化为 C struct，变量为指针，可为 null |
 | 接口类型 | TphpIface | Go itab 风格胖指针（对象指针 + 方法表），可为 null |

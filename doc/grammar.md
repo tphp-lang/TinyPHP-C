@@ -93,6 +93,7 @@ unary       = ("-" | "+" | "!" | "~" | "++" | "--"), unary | power ;
 power       = postfix, [ "**", unary ] ;             (* 右结合，高于一元负号 *)
 postfix     = primary, { postfixtail } ;
 postfixtail = "[", [expr], "]" | "->", ident, ["(", [args], ")"]
+            | var, "(", [args], ")"                    (* 闭包调用 $f(...) *)
             | "c", "->", IDENT, ["(", [args], ")"]   (* phpc 直连 *)
             | "::", ( var | IDENT, ["(", [args], ")"] )   (* ::$prop / ::CONST / ::method() *)
             | "or", block                                 (* 仅函数调用后 *)
@@ -100,7 +101,12 @@ postfixtail = "[", [expr], "]" | "->", ident, ["(", [args], ")"]
 primary     = literal | var | "this" | IDENT        (* 常量引用 / self:: 前半 *)
             | "[" [args] "]"
             | "new", ident, "(", [args], ")"
-            | "(", [casttype], expr, ")" ;
+            | "(", [casttype], expr, ")"
+            | closure                                              (* 闭包字面量 *)
+            | "fn", "(", [params], ")", [":", type], "=>", ( expr | block ) ;
+closure     = "function", "(", [params], ")", [ "use", "(", capture-list, ")" ],
+              [":", type], block ;
+capture-list = [ "&" ], var, { ",", [ "&" ], var } ;   (* & = 按引用捕获（堆盒子） *)
 casttype    = "int" | "float" | "double" | "bool" | "string" | c*别名 ;
 literal     = int | float | string | "true" | "false" | "null" ;
 ```
@@ -108,6 +114,23 @@ literal     = int | float | string | "true" | "false" | "null" ;
 ## 语义要点
 
 ### 入口与多文件
+
+`class Main` 的构造器可声明为无参或 `(int $argc, array<string> $argv)`——后者由
+`main` 传入命令行参数（旧版 tphp 惯例）：
+
+```php
+class Main
+{
+    public function __construct(int $argc, array<string> $argv)
+    {
+        // $argv[0] 为程序路径
+    }
+
+    public function main(): void { /* ... */ }
+}
+```
+
+类方法返回类型可写 `self`（= 声明类，链式 API）：`public function add(...): self { return $this; }`。
 
 ```php
 class Main
@@ -167,6 +190,9 @@ class Circle implements Shape { /* 必须实现全部方法，签名精确一致
 - 左结合可链式：`x |> f() |> g()` = `g(f(x))`
 - 右侧必须是 调用 / 方法调用 / 静态调用 / `c->` 直连调用；
   方法接收者不得含调用（避免管道值被求值两次）
+- **占位符 `...`**：`x |> f(a, ...)` 中的 `...` 标记左值的插入位置（任意参数位，
+  仅一次）；无占位符时默认插入首参。`...` 仅在管道右侧的调用参数中合法：
+  `x |> power(2, ...)` = `power(2, x)`
 - 可与 `or` 块组合：`$x |> parse() or { ... }`
 - 优先级介于赋值与三元之间：`$y = $x |> f();` 无需括号；
   三元分支内使用管道需加括号

@@ -24,8 +24,9 @@ final class Gen
     use GenStmtTrait;
     use GenExprTrait;
     use GenRcTrait;
+    use GenClosureTrait;
 
-    private const SECTION_ORDER = ['head', 'consts', 'typedefs', 'globals', 'protos', 'helpers', 'funcs', 'main'];
+    private const SECTION_ORDER = ['head', 'consts', 'typedefs', 'globals', 'protos', 'helpers', 'funcs', 'closures', 'main'];
 
     /** @var array<string, string> */
     private array $sections = [];
@@ -33,6 +34,7 @@ final class Gen
     private string $cur = 'head';
     private int $indent = 0;
     private int $tmpN = 0;
+    private int $closureSeq = 0;
 
     /** 当前正在生成的函数所属文件（#line 指令用） */
     private string $curFile = '';
@@ -65,12 +67,13 @@ final class Gen
         if (!$this->noMain) {
             $this->emitMain();
             if ($this->memStats) {
-                // 在 main 体开头插入统计开关（沿用原有的 {，不新增括号）
-                $this->sections['main'] = str_replace(
-                    "int main(void)\n{",
-                    "int main(void)\n{\n    tphp_mem_stats_on = true;\n    atexit(tphp_mem_report);",
-                    $this->sections['main'],
-                );
+                // 在 main 体开头插入统计开关（兼容 main(void) 与 main(int, char**) 两种签名）
+                $main = $this->sections['main'];
+                $pos = strpos($main, "\n{");
+                if ($pos !== false) {
+                    $inject = "    tphp_mem_stats_on = true;\n    atexit(tphp_mem_report);\n";
+                    $this->sections['main'] = substr($main, 0, $pos + 3) . $inject . substr($main, $pos + 3);
+                }
             }
         }
 

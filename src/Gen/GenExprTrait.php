@@ -13,10 +13,12 @@ use Tphp\Ast\expr\BinaryExpr;
 use Tphp\Ast\expr\BoolLit;
 use Tphp\Ast\expr\CallExpr;
 use Tphp\Ast\expr\CastExpr;
+use Tphp\Ast\expr\ClosureExpr;
 use Tphp\Ast\expr\FloatLit;
 use Tphp\Ast\expr\IndexExpr;
 use Tphp\Ast\expr\IntLit;
 use Tphp\Ast\expr\InterpStr;
+use Tphp\Ast\expr\InvokeExpr;
 use Tphp\Ast\expr\MethodCall;
 use Tphp\Ast\expr\NameExpr;
 use Tphp\Ast\expr\NewExpr;
@@ -78,10 +80,10 @@ trait GenExprTrait
             return $this->genInterp($e);
         }
         if ($e instanceof VarExpr) {
-            return Names::localVar($e->name);
+            return $this->varReadText($e);
         }
         if ($e instanceof ThisExpr) {
-            return 'self';
+            return $this->genThis($e);
         }
         if ($e instanceof ArrayLit) {
             return $this->genArrayLit($e);
@@ -107,10 +109,10 @@ trait GenExprTrait
         }
         if ($e instanceof CallExpr) {
             $call = $this->genCall($e);
-        // 内置函数（len/var_dump/phpc 桥接）不会失败；用户函数统一包装错误传播
+        // 内置函数（len/var_dump/phpc 桥接/c_fn）不会失败；用户函数统一包装错误传播
         if ($e->name === 'len' || $e->name === 'var_dump' || $e->name === 'c_str'
             || $e->name === 'php_str' || $e->name === 'php_str_ref'
-            || $e->name === 'cbuf' || $e->name === 'c_own') {
+            || $e->name === 'cbuf' || $e->name === 'c_own' || $e->name === 'c_fn') {
             return $call;
         }
         return $this->wrapFailable($call, $e->type);
@@ -146,6 +148,12 @@ trait GenExprTrait
         }
         if ($e instanceof StaticConst) {
             return $this->genStaticConstName($e);
+        }
+        if ($e instanceof ClosureExpr) {
+            return $this->genClosureExpr($e);
+        }
+        if ($e instanceof InvokeExpr) {
+            return $this->wrapFailable($this->genInvoke($e), $e->type);
         }
         if ($e instanceof CastExpr) {
             return $this->genCast($e);
@@ -499,11 +507,34 @@ trait GenExprTrait
         return $prefix ? '(' . $text . '(' . $lv . '))' : '((' . $lv . ')' . $text . ')';
     }
 
+    /** 变量读取文本：闭包捕获重映射 → 引用盒子解引用 → 普通 C 局部。 */
+    private function varReadText(VarExpr $e): string
+    {
+        $cap = $this->capLookup($e->name);
+        if ($cap !== null) {
+            return $cap;
+        }
+        if ($e->sym !== null && $this->isBoxedSym($e->sym)) {
+            return '(*' . Names::localVar($e->name) . '_box)';
+        }
+        return Names::localVar($e->name);
+    }
+
+    /** $this：闭包内重映射为 env->self。 */
+    private function genThis(ThisExpr $e): string
+    {
+        $cap = $this->capLookup('this');
+        if ($cap !== null) {
+            return $cap;
+        }
+        return 'self';
+    }
+
     /** 生成可赋值的 C 左值文本。 */
     private function genLValue(Expr $e): string
     {
         if ($e instanceof VarExpr) {
-            return Names::localVar($e->name);
+            return $this->varReadText($e);
         }
         if ($e instanceof ThisExpr) {
             return 'self';
@@ -568,7 +599,9 @@ trait GenExprTrait
             $borrowed = !$fresh && ($e->value instanceof VarExpr || $e->value instanceof PropFetch
                 || $e->value instanceof IndexExpr);
             // 简单变量 + 尚未声明（推断声明的降级路径）：语句表达式内声明
-            if ($target instanceof VarExpr && $this->rcScopeFind($lv) === null) {
+            // （捕获/盒子等重映射左值不走声明路径）
+            if ($target instanceof VarExpr && $lv === Names::localVar($target->name)
+                && $this->rcScopeFind($lv) === null) {
                 $seq = '({ ' . $this->cType($e->type) . ' ' . $lv . ' = ' . $value . '; ';
                 if ($borrowed) {
                     $seq .= $this->rcRefText($refSrc, $e->value->type) . '; ';
@@ -709,6 +742,10 @@ trait GenExprTrait
         }
         if ($e->name === 'cbuf') {
             return 'tphp_cbuf(' . $this->genExpr($e->args[0]) . ')';
+        }
+        // c_fn($closure)：生成 C 回调 trampoline（约定 C 回调尾参 void* userdata）
+        if ($e->name === 'c_fn') {
+            return $this->genCfn($e);
         }
 
         $fn = $this->table->fns[$e->name] ?? null;
@@ -903,7 +940,10 @@ trait GenExprTrait
 
     private function genMethodCall(MethodCall $e): string
     {
-        $objText = $this->genExpr($e->obj);
+        // 接收者是新鲜堆值产生式（如链式 $c->a()->b() 的中间结果）：hoist 入临时，语句尾释放
+        $objText = $this->isFreshProducer($e->obj) && $this->isHeapType($e->obj->type)
+            ? $this->rcHoist($e->obj)
+            : $this->genExpr($e->obj);
         $ot = $e->obj->type;
 
         // 接口接收者：itab 分发

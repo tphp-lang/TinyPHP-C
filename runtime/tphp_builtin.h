@@ -12,6 +12,16 @@ static void tphp_echo_float(float v) { printf("%g", (double)v); }
 static void tphp_echo_double(double v) { printf("%.14g", v); }
 static void tphp_echo_bool(bool v) { fputs(v ? "true" : "false", stdout); }
 
+/* char** argv → array<String>（Main::__construct(int, array<string>) 入参）。 */
+static Array *tphp_args_array(int argc, char **argv)
+{
+    Array *a = tphp_arr_new(sizeof(String), 8, 0);
+    for (int i = 0; i < argc; i++) {
+        a = tphp_arr_push_str(a, tphp_str_copy(argv[i], (int32_t)strlen(argv[i])));
+    }
+    return a;
+}
+
 static void tphp_echo_str(String s)
 {
     if (s.length > 0) {

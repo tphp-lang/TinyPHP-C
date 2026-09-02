@@ -54,7 +54,7 @@ Uncaught error: not ready
 php main.php examples/01_hello.php --run     # 编译并运行（exe 在当前目录，C 源码在 build/）
 php main.php examples/04_class.php           # 只编译出 04_class.exe（当前目录）
 php main.php examples/02_control.php --emit-c# 只生成 C 源码（build/ 目录，可直接阅读）
-php tests/run.php                            # 跑测试（21 个用例，含多文件/内存/推断/phpc/可见性/平台条件）
+php tests/run.php                            # 跑测试（33 个用例，含多文件/内存/推断/phpc/可见性/闭包/指令安全/平台条件）
 php tests/shared.php                         # 库模式测试（--shared + #[export] 符号导出）
 php tests/cross.php                          # 交叉编译测试（4 个目标）
 ```
@@ -167,20 +167,26 @@ class Main
 - **变量**：PHP 类型自动推导（`$x = 5;` 首次赋值定死）；C 侧类型（c.*/cstruct/指针）必须显式声明；显式 `int $x = 1;` 依旧合法；隐式转换仅数值宽化（float → c.f32 收窄仅浮点字面量豁免，float 变量须显式 `(c.f32)` 强转）
 - **常量**：顶层 `const [T] NAME = 字面量;`（类型注解可省）、类常量 `[vis] const T name`
   （`self::` / `ClassName::` 访问，可见性检查）、函数内常量
-- **运算符**：算术 `+ - * / % **`、拼接 `.`、位运算、逻辑、三元、管道 `|>`（左值插入右侧调用首参）、自增自减、复合赋值；
+- **运算符**：算术 `+ - * / % **`、拼接 `.`、位运算、逻辑、三元、管道 `|>`（左值默认插入首参，`...` 占位符可标记插入位置）、自增自减、复合赋值；
   `int / int` 按 C 整除；条件要求严格 `bool`
 - **控制流**：`if / elseif / else`、`while`、`do-while`、`for`、
   `foreach ($arr as $k => $v)`、`switch`（PHP 语义，不隐式穿透）、`break / continue`
 - **函数**：显式参数/返回类型、默认参数；**多文件编译**——入口 = 含 `class Main` 的文件，
   其余 .php 直接列在命令行，符号免 import（`<?php` 开标签可选）
+- **闭包**（`doc/closure.md`）：`function (int $v) use ($a, &$b) { }` 按值/按引用捕获、
+  `fn (int $v): int => $v + $a` 箭头糖（自动按值捕获）、`$f(...)` 调用；
+  引用捕获经堆盒子实现（内外共享存储，逃逸安全）；管道 `8 |> $f()` 直接可用
 - **类与接口**：单继承 + `implements` 多接口（itab 胖指针分发）、接口可继承接口、
-  字段平铺单态化、vtable 动态分发、`public/private/protected`、静态成员、`__construct`、`parent::`
+  字段平铺单态化、vtable 动态分发、`public/private/protected`、静态成员、`__construct`、`parent::`、
+  `: self` 链式返回；`Main::__construct(int $argc, array<string> $argv)` 可接收命令行参数
 - **错误处理**：`throw "msg";` 抛出；错误自动沿调用链上浮；`f() or { ... }` 处理——
   块内 `err` 为错误消息（string），值上下文取块内最后表达式；块内可用 `return`/`break`/`continue`；
   顶层未捕获打印 `Uncaught error:` 并以退出码 1 结束；无任何签名注解
 - **内置**：`echo`（语句）、`len()`、`var_dump()`、phpc 桥接 `c_str` / `php_str` / `php_str_ref` / `cbuf` / `c_own`
 - **导出**：`#[export("c_name")]` 注解为全局函数指定 C 符号名（库模式供宿主程序调用；仅顶层 function 有效）
-- **phpc（C 互操作）**：`#include` / `#flag` / `#struct` 指令 + `c->` 直连调用与常量引用；
+- **phpc（C 互操作）**：`#include` / `#flag` / `#struct` 指令（路径与选项白名单校验，
+  见 `doc/phpc.md`）+ `c->` 直连调用与常量引用；
+  `c_fn($closure)` 闭包 → C 回调函数指针（约定 C 回调尾参 `void* userdata`，trampoline 转发）；
   C 内存自动管理（`cbuf`/`c_own` 登记，函数出口自动 free，开发者不写 free）——详见 `doc/phpc.md`
 - **入口**：`class Main` + `main(): void`
 

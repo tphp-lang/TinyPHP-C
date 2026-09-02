@@ -20,6 +20,9 @@ final class FnSymbol
     /** #[export("c_name")] 注解的 C 符号名（仅全局函数；null = 默认 tphp_<name>）。 */
     public ?string $exportName = null;
 
+    /** 返回类型为 callable 且 return 闭包字面量时记录其签名（sig 预流动遍回填）。 */
+    public ?array $retClosureSig = null;
+
     public function __construct(
         public readonly string $name,
         public readonly ?Pos $pos = null,

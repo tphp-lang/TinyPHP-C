@@ -10,12 +10,42 @@ use Tphp\Ast\decl\FunctionDecl;
 use Tphp\Ast\decl\InterfaceDecl;
 use Tphp\Ast\Expr;
 use Tphp\Ast\File;
+use Tphp\Ast\expr\ArrayLit;
+use Tphp\Ast\expr\AssignExpr;
+use Tphp\Ast\expr\BinaryExpr;
 use Tphp\Ast\expr\BoolLit;
+use Tphp\Ast\expr\CallExpr;
+use Tphp\Ast\expr\CastExpr;
+use Tphp\Ast\expr\CCallExpr;
+use Tphp\Ast\expr\ClosureExpr;
 use Tphp\Ast\expr\FloatLit;
+use Tphp\Ast\expr\IndexExpr;
+use Tphp\Ast\expr\InterpStr;
+use Tphp\Ast\expr\InvokeExpr;
 use Tphp\Ast\expr\IntLit;
+use Tphp\Ast\expr\MethodCall;
+use Tphp\Ast\expr\NewExpr;
 use Tphp\Ast\expr\NullLit;
+use Tphp\Ast\expr\OrExpr;
+use Tphp\Ast\expr\PropFetch;
+use Tphp\Ast\expr\StaticCall;
 use Tphp\Ast\expr\StrLit;
+use Tphp\Ast\expr\TernaryExpr;
 use Tphp\Ast\expr\UnaryExpr;
+use Tphp\Ast\stmt\BlockStmt;
+use Tphp\Ast\stmt\DoWhileStmt;
+use Tphp\Ast\stmt\EchoStmt;
+use Tphp\Ast\stmt\ExprStmt;
+use Tphp\Ast\stmt\ForeachStmt;
+use Tphp\Ast\stmt\ForStmt;
+use Tphp\Ast\stmt\IfStmt;
+use Tphp\Ast\stmt\LocalConstStmt;
+use Tphp\Ast\stmt\LocalDecl;
+use Tphp\Ast\stmt\ReturnStmt;
+use Tphp\Ast\stmt\Stmt;
+use Tphp\Ast\stmt\SwitchStmt;
+use Tphp\Ast\stmt\ThrowStmt;
+use Tphp\Ast\stmt\WhileStmt;
 use Tphp\Table\ClassSymbol;
 use Tphp\Table\ConstSymbol;
 use Tphp\Table\FnSymbol;
@@ -249,7 +279,9 @@ trait CheckDeclTrait
                     $this->registerProp($sym, $prop);
                 }
                 foreach ($decl->methods as $method) {
+                    $this->curClass = $sym; // : self 等类型解析需要类上下文
                     $this->registerMethod($sym, $method);
+                    $this->curClass = null;
                 }
                 $this->buildVtable($sym);
             }
@@ -472,6 +504,20 @@ trait CheckDeclTrait
             $this->error('程序入口必须包含全局命名空间的 class Main', new Pos($entryPath, 1, 1));
             return;
         }
+        // 构造器可声明为无参或 (int $argc, array<string> $argv)——命令行参数入口（旧版 tphp 惯例）
+        $ctor = $main->methods['__construct'] ?? null;
+        if ($ctor !== null && $ctor->params !== []) {
+            $ok = count($ctor->params) === 2
+                && $ctor->params[0]->type === Type::I_INT
+                && $this->table->isArray($ctor->params[1]->type)
+                && $this->table->arrayElemOf($ctor->params[1]->type) === Type::I_STRING;
+            if (!$ok) {
+                $this->error(
+                    'Main::__construct 的参数签名必须是 (int $argc, array<string> $argv) 或无参',
+                    $ctor->pos,
+                );
+            }
+        }
         $fn = $main->methods['main'] ?? null;
         if ($fn === null) {
             $this->error('class Main 必须定义 main() 方法', $main->pos);
@@ -488,7 +534,21 @@ trait CheckDeclTrait
     /** @param list<File> $files */
     private function checkBodies(array $files): void
     {
+        // 第一遍：闭包签名流动（实参→形参、return→函数、赋值→变量）。
+        // 跨函数传播依赖"调用点先于被调体检查"的顺序不可保证，故先静默跑一遍。
+        $this->sigOnly = true;
         foreach ($files as $file) {
+            $this->checkBodiesOnce($file);
+        }
+        $this->sigOnly = false;
+        foreach ($files as $file) {
+            $this->checkBodiesOnce($file);
+        }
+    }
+
+    private function checkBodiesOnce(File $file): void
+    {
+        {
             foreach ($file->decls as $decl) {
                 if ($decl instanceof FunctionDecl) {
                     $fn = $this->table->fns[$this->fqPrefix($file) . $decl->name] ?? null;
@@ -519,9 +579,17 @@ trait CheckDeclTrait
     {
         $this->curFn = $fn;
         $this->scope = new Scope(null, $fn);
+        $this->boxedNames = [];
+        $this->scanClosureRefCaptures($body); // 预扫描：本函数体内 use (&$var) 名单
 
         foreach ($fn->params as $param) {
-            $this->scope->vars[$param->name] = new VarSymbol($param->name, $param->type, $param->pos);
+            $sym = new VarSymbol($param->name, $param->type, $param->pos);
+            $sym->closureSig = $param->closureSig;
+            if (isset($this->boxedNames[$param->name])) {
+                $sym->boxed = true;
+                $param->boxed = true;
+            }
+            $this->scope->vars[$param->name] = $sym;
         }
         if ($fn->isMethod && !$fn->isStatic) {
             $this->scope->vars['this'] = new VarSymbol('this', $fn->ownerClass->code, $fn->pos);
@@ -533,10 +601,151 @@ trait CheckDeclTrait
         $this->curFn = null;
     }
 
+    // ------------------------------------------------------------------ 闭包引用捕获预扫描
+
+    /** 预扫描函数体：收集全部 use (&$var) 捕获名（声明落地为堆盒子用，doc/closure.md §3.5）。 */
+    private function scanClosureRefCaptures(array $body): void
+    {
+        $this->scanStmts($body);
+    }
+
+    /** @param list<object> $stmts */
+    private function scanStmts(array $stmts): void
+    {
+        foreach ($stmts as $s) {
+            $this->scanStmt($s);
+        }
+    }
+
+    private function scanStmt(object $s): void
+    {
+        if ($s instanceof BlockStmt) {
+            $this->scanStmts($s->stmts);
+        } elseif ($s instanceof IfStmt) {
+            $this->scanExpr($s->cond);
+            $this->scanStmts($s->then);
+            if ($s->else !== null) {
+                $this->scanStmts($s->else);
+            }
+        } elseif ($s instanceof WhileStmt) {
+            $this->scanExpr($s->cond);
+            $this->scanStmts($s->body);
+        } elseif ($s instanceof DoWhileStmt) {
+            $this->scanStmts($s->body);
+            $this->scanExpr($s->cond);
+        } elseif ($s instanceof ForStmt) {
+            if ($s->init !== null) {
+                $this->scanStmt($s->init);
+            }
+            if ($s->cond !== null) {
+                $this->scanExpr($s->cond);
+            }
+            if ($s->post !== null) {
+                $this->scanExpr($s->post);
+            }
+            $this->scanStmts($s->body);
+        } elseif ($s instanceof ForeachStmt) {
+            $this->scanExpr($s->arr);
+            $this->scanStmts($s->body);
+        } elseif ($s instanceof SwitchStmt) {
+            $this->scanExpr($s->cond);
+            foreach ($s->cases as $c) {
+                if ($c->cond !== null) {
+                    $this->scanExpr($c->cond);
+                }
+                $this->scanStmts($c->stmts);
+            }
+        } elseif ($s instanceof ReturnStmt) {
+            if ($s->expr !== null) {
+                $this->scanExpr($s->expr);
+            }
+        } elseif ($s instanceof EchoStmt) {
+            foreach ($s->parts as $p) {
+                $this->scanExpr($p);
+            }
+        } elseif ($s instanceof ExprStmt) {
+            $this->scanExpr($s->expr);
+        } elseif ($s instanceof ThrowStmt) {
+            $this->scanExpr($s->expr);
+        } elseif ($s instanceof LocalConstStmt) {
+            $this->scanExpr($s->value);
+        } elseif ($s instanceof LocalDecl) {
+            if ($s->init !== null) {
+                $this->scanExpr($s->init);
+            }
+        }
+        // Break / Continue 无子节点
+    }
+
+    private function scanExpr(Expr $e): void
+    {
+        if ($e instanceof ClosureExpr) {
+            // 闭包体不进入，但其 use (&$var) 引用捕获名要登记（外层变量提升为盒子）
+            foreach ($e->captures as $c) {
+                if ($c['byRef']) {
+                    $this->boxedNames[$c['name']] = true;
+                }
+            }
+            return;
+        }
+        if ($e instanceof AssignExpr) {
+            $this->scanExpr($e->target);
+            $this->scanExpr($e->value);
+        } elseif ($e instanceof BinaryExpr) {
+            $this->scanExpr($e->left);
+            $this->scanExpr($e->right);
+        } elseif ($e instanceof TernaryExpr) {
+            $this->scanExpr($e->cond);
+            $this->scanExpr($e->then);
+            $this->scanExpr($e->else);
+        } elseif ($e instanceof UnaryExpr) {
+            $this->scanExpr($e->expr);
+        } elseif ($e instanceof PostfixExpr) {
+            $this->scanExpr($e->expr);
+        } elseif ($e instanceof CastExpr) {
+            $this->scanExpr($e->expr);
+        } elseif ($e instanceof IndexExpr) {
+            $this->scanExpr($e->base);
+            if ($e->index !== null) {
+                $this->scanExpr($e->index);
+            }
+        } elseif ($e instanceof PropFetch) {
+            $this->scanExpr($e->obj);
+        } elseif ($e instanceof MethodCall) {
+            $this->scanExpr($e->obj);
+            $this->scanExprs($e->args);
+        } elseif ($e instanceof InvokeExpr) {
+            $this->scanExpr($e->callee);
+            $this->scanExprs($e->args);
+        } elseif ($e instanceof OrExpr) {
+            $this->scanExpr($e->call);
+            $this->scanStmts($e->block);
+        } elseif ($e instanceof InterpStr) {
+            foreach ($e->parts as $p) {
+                if (!is_string($p)) {
+                    $this->scanExpr($p);
+                }
+            }
+        } elseif ($e instanceof ArrayLit) {
+            $this->scanExprs($e->items);
+        } elseif ($e instanceof CallExpr
+            || $e instanceof NewExpr || $e instanceof StaticCall || $e instanceof CCallExpr) {
+            $this->scanExprs($e->args);
+        }
+        // 字面量 / Var / This / Name / StaticProp / StaticConst / CConst 无需下钻
+    }
+
+    /** @param list<Expr> $exprs */
+    private function scanExprs(array $exprs): void
+    {
+        foreach ($exprs as $e) {
+            $this->scanExpr($e);
+        }
+    }
+
     /** 属性/参数默认值必须是标量或 null 字面量。 */
     private function isLiteralScalar(Expr $e): bool
-    {
-        if ($e instanceof IntLit || $e instanceof FloatLit || $e instanceof StrLit || $e instanceof BoolLit || $e instanceof NullLit) {
+    {        if ($e instanceof IntLit || $e instanceof FloatLit || $e instanceof StrLit || $e instanceof BoolLit || $e instanceof NullLit) {
             return true;
         }
         if ($e instanceof UnaryExpr

@@ -15,6 +15,15 @@ final class VarSymbol
 {
     public ?ClassSymbol $owner = null;
 
+    /** callable 变量的闭包签名（Checker 从闭包字面量回填）：[ret, list<paramType>] */
+    public ?array $closureSig = null;
+
+    /** 被 use (&$var) 引用捕获：存储提升为堆盒子（doc/closure.md §3.5） */
+    public bool $boxed = false;
+
+    /** 闭包捕获进入的变量（非本作用域声明，禁止再被引用捕获） */
+    public bool $isCapture = false;
+
     public function __construct(
         public readonly string $name,
         public int $type = 0,

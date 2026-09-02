@@ -8,6 +8,9 @@
 // <y>
 // int(42)
 // string(15) "php-85-released"
+// 8
+// 10
+// 5
 
 function twice(int $n): int
 {
@@ -22,6 +25,15 @@ function add(int $a, int $b): int
 function exclaim(string $s): string
 {
     return $s . "!";
+}
+
+function power(int $base, int $exp): int
+{
+    int $r = 1;
+    for (int $i = 0; $i < $exp; $i = $i + 1) {
+        $r = $r * $base;
+    }
+    return $r;
 }
 
 function trimBoth(string $s): string
@@ -90,5 +102,10 @@ class Main
             |> replace("H", "h")
             |> replace("R", "r");
         var_dump($slug);
+
+        // ... 占位符：管道值插入占位符所在参数位（可任意位置，仅一次）
+        echo 3 |> power(2, ...), "\n";
+        echo 5 |> twice(...), "\n";
+        echo 4 |> add(1, ...), "\n";
     }
 }

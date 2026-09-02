@@ -480,6 +480,7 @@ trait GenDeclTrait
         $this->indent = 1;
         $this->rcScopeBegin('function');
         $this->w('size_t __cmem = tphp_cmem_mark();');
+        $this->genBoxedParams($fn);
         $this->rcParamIncrefs($fn);
         $this->rcRegisterParams($fn);
         $this->genBodyStmts($body);
@@ -510,6 +511,7 @@ trait GenDeclTrait
         }
         $this->rcScopeBegin('function');
         $this->w('size_t __cmem = tphp_cmem_mark();');
+        $this->genBoxedParams($fn);
         $this->rcParamIncrefs($fn);
         $this->rcRegisterParams($fn);
         $this->genBodyStmts($body);
@@ -644,6 +646,8 @@ trait GenDeclTrait
         $this->begin('main');
         $main = $this->table->classes['Main'] ?? null;
         $fn = $main?->findMethod('main');
+        $ctor = $main !== null ? $this->effectiveCtor($main) : null;
+        $needsArgs = $ctor !== null && $ctor[0]->params !== [];
         if ($fn === null) {
             $this->w('int main(void)');
             $this->w('{');
@@ -651,13 +655,28 @@ trait GenDeclTrait
             $this->w('}');
             return;
         }
-        $this->w('int main(void)');
+        $this->w($needsArgs ? 'int main(int argc, char **argv)' : 'int main(void)');
         $this->w('{');
+        // 闭包环境/引用盒子的回收必须先于内存统计（析构会递减捕获的堆引用）
+        $this->w('    atexit(tphp_env_free_all);');
         if ($fn->isStatic) {
             $this->w('    ' . Names::method('Main', 'main') . '();');
             $this->w('    if (tphp_err_has()) { tphp_err_uncaught(tphp_err_take()); }');
         } else {
-            $this->w('    ' . Names::classStruct('Main') . '* __m = ' . Names::newHelper('Main') . '();');
+            $ctorArgs = '';
+            $arrVar = '';
+            if ($needsArgs) {
+                $arrVar = 'Array* __args = tphp_args_array(argc, argv);';
+                $ctorArgs = 'argc, __args';
+            }
+            if ($arrVar !== '') {
+                $this->w('    ' . $arrVar);
+            }
+            $this->w('    ' . Names::classStruct('Main') . '* __m = ' . Names::newHelper('Main') . '(' . $ctorArgs . ');');
+            if ($arrVar !== '') {
+                // 调用方创建引用的释放（形参由构造器自持）
+                $this->w('    tphp_arr_unref(__args);');
+            }
             $this->w('    ' . Names::method('Main', 'main') . '(__m);');
             $this->w('    tphp_object_unref(__m);');
             $this->w('    if (tphp_err_has()) { tphp_err_uncaught(tphp_err_take()); }');

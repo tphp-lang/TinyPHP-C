@@ -30,11 +30,14 @@ trait ParserDeclTrait
             if ($this->is(TokenKind::DirInclude)) {
                 $lit = $this->next()->lit;
                 $path = substr($lit, strlen('include '));
+                $this->validateInclude($path);
                 $this->fileIncludes[] = $path;
                 continue;
             }
             if ($this->is(TokenKind::DirFlag)) {
-                $this->fileCflags[] = $this->next()->lit;
+                $lit = $this->next()->lit;
+                $this->validateFlag($lit);
+                $this->fileCflags[] = $lit;
                 continue;
             }
             if ($this->is(TokenKind::DirStruct)) {
@@ -92,6 +95,111 @@ trait ParserDeclTrait
             $this->next();
         }
         return $decls;
+    }
+
+    // ------------------------------------------------------------------ phpc 指令安全校验
+
+    /**
+     * #include 安全校验：`<...>` 系统头放行；`"..."` 相对路径必须停留在项目内。
+     * （对齐 vlang：源文件不可通过指令触达构建机上的任意文件。）
+     */
+    private function validateInclude(string $path): void
+    {
+        if (str_starts_with($path, '<')) {
+            return; // 系统头
+        }
+        if (!str_starts_with($path, '"') || !str_ends_with($path, '"') || strlen($path) < 3) {
+            $this->errHere('#include 语法应为 <系统头> 或 "相对路径"');
+            return;
+        }
+        $p = substr($path, 1, -1);
+        if (!$this->isSafeRelativePath($p)) {
+            $this->errHere("#include 路径必须是不含 \"..\" 的项目内相对路径，得到 \"{$p}\"");
+            return;
+        }
+        if (!str_ends_with($p, '.h')) {
+            $this->errHere("#include 只允许 .h 头文件，得到 \"{$p}\"");
+        }
+    }
+
+    /**
+     * #flag 安全校验（白名单，对齐 vlang ast.parse_cflag 并更严格）：
+     *   -I/-L 路径、-l 库名、-D 宏、-U/-std/-f/-m/-O/-g/-W 编译选项、.c/.h/.o/.a 链接文件。
+     * 拒绝：反引号与 shell 元字符、`..` 路径、盘符绝对路径、一切其他编译器标志
+     * （-B/-specs/-wrapper/--include 等可让构建机执行任意文件的标志被白名单天然挡下）。
+     * 构建者自身的可信参数走 CLI --cflag=（不经此校验）。
+     */
+    private function validateFlag(string $text): void
+    {
+        if (preg_match('/[`;$&|]/', $text) === 1 || str_contains($text, '$(')) {
+            $this->errHere("#flag 含非法字符（shell 元字符）：{$text}");
+            return;
+        }
+        foreach (preg_split('/\s+/', trim($text)) ?: [] as $tok) {
+            if ($tok === '') {
+                continue;
+            }
+            if ($tok[0] === '-') {
+                if (!$this->isAllowedCompilerFlag($tok)) {
+                    $this->errHere("#flag 不允许编译器选项 \"{$tok}\"（允许 -I -L -l -D -U -std -f -m -O -g -W 及 .c/.h/.o/.a 文件）；构建者参数请用 CLI --cflag=");
+                    return;
+                }
+                continue;
+            }
+            // 裸 token = 附加源文件 / 归档
+            if (!str_ends_with($tok, '.c') && !str_ends_with($tok, '.h')
+                && !str_ends_with($tok, '.o') && !str_ends_with($tok, '.a')) {
+                $this->errHere("#flag 裸参数只允许 .c/.h/.o/.a 文件，得到 \"{$tok}\"");
+                return;
+            }
+            if (!$this->isSafeRelativePath($tok)) {
+                $this->errHere("#flag 文件路径必须是不含 \"..\" 的项目内相对路径：\"{$tok}\"");
+                return;
+            }
+        }
+    }
+
+    /** 编译器标志白名单；返回 false = 拒绝。 */
+    private function isAllowedCompilerFlag(string $tok): bool
+    {
+        // 危险特例（会被宽松前缀误放行）
+        if (str_starts_with($tok, '-wrapper') || str_starts_with($tok, '-B')
+            || str_starts_with($tok, '-specs') || str_starts_with($tok, '--include')
+            || str_starts_with($tok, '-imacros') || str_starts_with($tok, '-Xlinker')) {
+            return false;
+        }
+        foreach (['-I', '-L', '-l', '-D', '-U', '-std=', '-f', '-m', '-O', '-g', '-W'] as $prefix) {
+            if (str_starts_with($tok, $prefix) && strlen($tok) > strlen($prefix)) {
+                $value = substr($tok, strlen($prefix));
+                return match ($prefix) {
+                    '-I', '-L' => $this->isSafeRelativePath($value),
+                    '-l' => preg_match('/^[A-Za-z0-9_.+-]+$/', $value) === 1,
+                    '-D' => preg_match('/^[A-Za-z_][A-Za-z0-9_]*(=[^"\'`\\\\;]*)?$/', $value) === 1,
+                    '-U' => preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $value) === 1,
+                    '-std=' => preg_match('/^[a-z0-9+]+$/', $value) === 1,
+                    default => preg_match('/^[A-Za-z0-9_.=,:+\/-]*$/', $value) === 1, // -f/-m/-O/-g/-W 值字符白名单
+                };
+            }
+        }
+        return false;
+    }
+
+    /** 相对路径安全：非绝对、无 ..、无反引号。 */
+    private function isSafeRelativePath(string $p): bool
+    {
+        if ($p === '' || str_contains($p, "\0")) {
+            return false;
+        }
+        $norm = str_replace('\\', '/', $p);
+        if (str_starts_with($norm, '/') || preg_match('/^[A-Za-z]:/', $norm) === 1) {
+            return false; // 绝对路径
+        }
+        foreach (explode('/', $norm) as $seg) {
+            if ($seg === '..') {
+                return false;
+            }
+        }
+        return !str_contains($p, '`');
     }
 
     /** #struct 体：#struct Name { c.u8 r; c.char* p; ... }（类型本体由头文件提供）。 */
@@ -378,6 +486,7 @@ trait ParserDeclTrait
             TokenKind::KwString => 'string',
             TokenKind::KwCallable => 'callable',
             TokenKind::KwVoid => 'void',
+            TokenKind::KwSelf => 'self', // : self 链式返回（Checker 解析为声明类）
             TokenKind::KwNull => 'null', // null 类型 = C 的 void*
             default => null,
         };
@@ -397,6 +506,10 @@ trait ParserDeclTrait
         if ($kind === TokenKind::Ident) {
             $this->next();
             $name = $t->lit;
+            // self 返回类型：保留原名，Checker 解析为当前类（: self 链式返回）
+            if ($name === 'self') {
+                return new TypeRef('self')->withPos($t->pos);
+            }
             $hasBackslash = false;
             while ($this->is(TokenKind::Backslash)) {
                 $this->next();

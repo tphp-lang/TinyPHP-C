@@ -88,6 +88,7 @@ final class Table
         $this->fns['php_str_ref'] = new FnSymbol('php_str_ref', isBuiltin: true);
         $this->fns['c_own'] = new FnSymbol('c_own', isBuiltin: true);
         $this->fns['cbuf'] = new FnSymbol('cbuf', isBuiltin: true);
+        $this->fns['c_fn'] = new FnSymbol('c_fn', isBuiltin: true); // 闭包 → C 回调函数指针（约定尾参 void* ud）
     }
 
     private function registerBuiltin(int $code, string $name): void

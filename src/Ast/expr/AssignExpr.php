@@ -13,6 +13,9 @@ use Tphp\Token\TokenKind;
  */
 final class AssignExpr extends Expr
 {
+    /** 首次赋值推断声明被引用捕获（boxed）：落地为堆盒子（Checker 回填） */
+    public bool $boxedDecl = false;
+
     public function __construct(
         public readonly TokenKind $op,
         public readonly Expr $target,

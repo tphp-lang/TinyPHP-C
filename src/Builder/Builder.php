@@ -150,6 +150,10 @@ final class Builder
             foreach ($file->cflags as $flag) {
                 foreach (preg_split('/\s+/', trim($flag)) ?: [] as $token) {
                     if (str_ends_with($token, '.c')) {
+                        if (!is_file($token)) {
+                            fwrite(STDERR, "TinyPHP: {$file->path}: #flag 引用的源文件不存在 {$token}\n");
+                            exit(1);
+                        }
                         $sources[] = $token;
                     }
                 }

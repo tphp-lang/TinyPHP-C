@@ -93,18 +93,21 @@ trait GenRcTrait
     private function rcScopeEnd(): void
     {
         $scope = array_pop($this->rcScopes);
-        foreach (array_reverse($scope['vars'], true) as $name => $t) {
-            if ($this->isHeapType($t)) {
-                $this->rcUnrefStmt($name, $t);
+        foreach (array_reverse($scope['vars'], true) as $name => $v) {
+            if (!$v['keep'] && $this->isHeapType($v['t'])) {
+                $this->rcUnrefStmt($name, $v['t']);
             }
         }
     }
 
-    /** 登记一个局部变量到当前作用域（全部类型登记，供“是否已声明”判定；清理时仅堆类型递减）。 */
-    private function rcDeclareLocal(string $cName, int $type): void
+    /**
+     * 登记一个局部变量到当前作用域（全部类型登记，供"是否已声明"判定；清理时仅堆类型递减）。
+     * $keep=true：所有权不归本作用域（闭包捕获字段 / 引用盒子内容），退出不递减。
+     */
+    private function rcDeclareLocal(string $cName, int $type, bool $keep = false): void
     {
         $top = count($this->rcScopes) - 1;
-        $this->rcScopes[$top]['vars'][$cName] = $type;
+        $this->rcScopes[$top]['vars'][$cName] = ['t' => $type, 'keep' => $keep];
     }
 
     /** 查找变量当前持有的类型码（未声明返回 null）。 */
@@ -112,7 +115,7 @@ trait GenRcTrait
     {
         for ($i = count($this->rcScopes) - 1; $i >= 0; $i--) {
             if (isset($this->rcScopes[$i]['vars'][$cName])) {
-                return $this->rcScopes[$i]['vars'][$cName];
+                return $this->rcScopes[$i]['vars'][$cName]['t'];
             }
         }
         return null;
@@ -134,9 +137,9 @@ trait GenRcTrait
 
     private function rcCleanupScope(array $scope): void
     {
-        foreach (array_reverse($scope['vars'], true) as $name => $t) {
-            if ($this->isHeapType($t)) {
-                $this->rcUnrefStmt($name, $t);
+        foreach (array_reverse($scope['vars'], true) as $name => $v) {
+            if (!$v['keep'] && $this->isHeapType($v['t'])) {
+                $this->rcUnrefStmt($name, $v['t']);
             }
         }
     }

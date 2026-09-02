@@ -430,6 +430,12 @@ final class Scanner
             $this->error('不支持 ?? 与 ?-> 运算符');
             return;
         }
+        if ($c === '.' && $c2 === '.' && $c3 === '.') {
+            $this->step(); // 第二个点
+            $this->step(); // 第三个点
+            $this->emit(TokenKind::Ellipsis, $start);
+            return;
+        }
         if ($c === '@' || $c === '`') {
             $this->error("意外的字符 '{$c}'");
             return;
@@ -540,6 +546,7 @@ final class Scanner
             'throw' => TokenKind::KwThrow,
             'or' => TokenKind::KwOr,
             'function' => TokenKind::KwFunction,
+            'fn' => TokenKind::KwFn,
             'class' => TokenKind::KwClass,
             'const' => TokenKind::KwConst,
             'extends' => TokenKind::KwExtends,

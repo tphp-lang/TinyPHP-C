@@ -40,6 +40,18 @@ final class Checker
     private int $loopDepth = 0;
     private int $switchDepth = 0;
 
+    /** @var array<string, true> 当前函数体内全部 use (&$var) 捕获名（预扫描，盒子声明判定用） */
+    private array $boxedNames = [];
+
+    /** 闭包嵌套深度：>0 表示正在检查闭包体（引用捕获禁止）。 */
+    private int $closureDepth = 0;
+
+    /** @var list<array{auto: bool, scope: Scope, node: object, containerFn: ?FnSymbol}> 闭包体检查上下文栈 */
+    private array $closureCtx = [];
+
+    /** 闭包签名预流动遍：只传播签名数据（错误丢弃），正式检查在其后。 */
+    public bool $sigOnly = false;
+
     public function __construct(
         private readonly Table $table,
         private readonly Errors $errors,
@@ -109,12 +121,23 @@ final class Checker
 
     private function error(string $msg, ?Pos $pos): void
     {
+        if ($this->sigOnly) {
+            return; // 签名预流动遍：诊断丢弃，正式检查会重现
+        }
         $this->errors->add($msg, $pos ?? new Pos('<unknown>', 1, 1));
     }
 
     /** 解析类型引用为类型码。 */
     private function resolveTypeRef(TypeRef $ref): int
     {
+        // self 返回类型：方法声明的返回类型 = 声明类（: self 链式返回）
+        if ($ref->name === 'self') {
+            if ($this->curClass === null) {
+                $this->error('self 类型只能在类方法声明中使用', $ref->pos);
+                return Type::NONE;
+            }
+            return $this->curClass->code;
+        }
         if ($ref->name === 'array') {
             if ($ref->elem === null) {
                 return Type::I_ARRAY;

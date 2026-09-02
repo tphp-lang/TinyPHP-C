@@ -50,6 +50,7 @@ enum TokenKind
 
     // 关键字 — 声明
     case KwFunction;
+    case KwFn;      // fn(...) => expr 箭头闭包
     case KwClass;
     case KwConst;
     case KwExtends;
@@ -136,6 +137,7 @@ enum TokenKind
     case AmpEq;
     case PipeEq;
     case PipeRight;  // |> 管道：左值插入右侧调用首参
+    case Ellipsis;   // ... 管道占位符（仅管道右侧调用参数中合法）
     case CaretEq;
     case ShlEq;
     case ShrEq;

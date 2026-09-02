@@ -6,6 +6,7 @@ namespace Tphp\Checker;
 
 use Tphp\Ast\Stmt;
 use Tphp\Ast\expr\ArrayLit;
+use Tphp\Ast\expr\ClosureExpr;
 use Tphp\Ast\stmt\BlockStmt;
 use Tphp\Ast\stmt\BreakStmt;
 use Tphp\Ast\stmt\ContinueStmt;
@@ -191,7 +192,17 @@ trait CheckStmtTrait
         }
 
         if ($s instanceof ReturnStmt) {
-            $ret = $this->curFn?->ret ?? Type::I_VOID;
+            $fnRet = $this->curFn?->ret ?? Type::I_VOID;
+            if ($fnRet === Type::NONE) {
+                // 箭头闭包返回类型推断（省略 : T 时取 return 表达式类型）
+                if ($s->expr === null) {
+                    $this->error('箭头闭包必须 return 一个值', $s->pos);
+                    return;
+                }
+                $this->curFn->ret = $this->checkExpr($s->expr);
+                return;
+            }
+            $ret = $fnRet;
             if ($s->expr === null) {
                 if (!$this->table->isVoid($ret)) {
                     $this->error(
@@ -215,6 +226,10 @@ trait CheckStmtTrait
                     . '，得到 ' . $this->table->displayName($t) . $this->narrowHint($ret, $t),
                     $s->expr->pos,
                 );
+            }
+            // callable 返回 + 闭包字面量：签名挂到函数（调用点经 retClosureSig 流向接收变量）
+            if ($this->table->isCallable($ret) && $s->expr instanceof ClosureExpr) {
+                $this->curFn->retClosureSig = $s->expr->sig;
             }
             return;
         }
@@ -282,7 +297,15 @@ trait CheckStmtTrait
                     }
                 }
             }
-            $this->scope->vars[$s->name] = new VarSymbol($s->name, $type, $s->pos);
+            $vs = new VarSymbol($s->name, $type, $s->pos);
+            if ($s->init instanceof ClosureExpr) {
+                $vs->closureSig = $s->init->sig;
+            }
+            if (isset($this->boxedNames[$s->name])) {
+                $vs->boxed = true;
+                $s->boxed = true;
+            }
+            $this->scope->vars[$s->name] = $vs;
             return;
         }
     }
