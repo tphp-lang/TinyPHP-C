@@ -40,6 +40,20 @@ static void *tphp_object_alloc(size_t size, void *vt, void (*dtor)(void *))
     return o;
 }
 
+/* 枚举 case 等进程期单例：巨量初始引用（借用者无法耗尽）、不进内存统计，
+ * 生命周期 = 进程（doc/grammar.md 枚举类一节）。 */
+static void *tphp_object_alloc_static(size_t size, void *vt, void (*dtor)(void *))
+{
+    TphpObjHead *o = (TphpObjHead *)calloc(1, size);
+    if (!o) {
+        tphp_panic("out of memory");
+    }
+    o->refcount = 1 << 30;
+    o->vt = vt;
+    o->dtor = dtor;
+    return o;
+}
+
 static void tphp_object_ref(void *obj)
 {
     if (obj) {

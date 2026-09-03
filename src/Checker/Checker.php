@@ -65,6 +65,7 @@ final class Checker
         $this->collectCStructs($files);
         $this->collectClasses($files);
         $this->collectInterfaces($files);
+        $this->collectEnums($files);
         $this->collectConsts($files);
         $this->collectMembers($files);
         $this->collectFunctions($files);

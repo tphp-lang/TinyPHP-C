@@ -260,6 +260,14 @@ trait CheckExprTrait
         if ($class === null) {
             return Type::NONE;
         }
+        // 枚举 case 引用：类型 = 枚举类（单例，== 即指针恒等）
+        if ($class->isEnum) {
+            $case = $class->findEnumCase($e->name);
+            if ($case !== null) {
+                $e->isEnumCase = true;
+                return $class->code;
+            }
+        }
         $const = $class->findConst($e->name);
         if ($const === null) {
             $this->error("类 {$class->name} 没有常量 {$e->name}", $e->pos);
@@ -647,6 +655,10 @@ trait CheckExprTrait
             case TokenKind::Caret:
             case TokenKind::Shl:
             case TokenKind::Shr:
+                if ($lt === Type::I_CVAL || $rt === Type::I_CVAL) {
+                    // CVAL（c-> 常量/调用）混入位运算：结果 CVAL（生成 C 原样，信任程序员）
+                    return Type::I_CVAL;
+                }
                 if ($table->isIntLike($lt) && $table->isIntLike($rt)) {
                     return $this->numericPromote($lt, $rt);
                 }
@@ -897,6 +909,17 @@ trait CheckExprTrait
         }
 
         if ($t instanceof PropFetch) {
+            // 枚举 case 的 name/value 只读（赋值目标拦截）
+            if ($t->obj instanceof VarExpr || $t->obj instanceof ThisExpr) {
+                $ot = $this->checkExpr($t->obj);
+                if ($this->table->isClass($ot)) {
+                    $cls = $this->table->classByCode($ot);
+                    if ($cls->isEnum && ($t->name === 'name' || $t->name === 'value')) {
+                        $this->error("枚举 case 的 ->{$t->name} 是只读的", $t->pos);
+                        return Type::NONE;
+                    }
+                }
+            }
             return $this->resolveProp($t);
         }
 
@@ -911,6 +934,7 @@ trait CheckExprTrait
     private function resolveProp(PropFetch $e): int
     {
         $ot = $this->checkExpr($e->obj);
+
 
         // cstruct 值字段访问：$v->field（生成 C 点访问）
         if ($this->table->isCStruct($ot)) {
@@ -936,6 +960,14 @@ trait CheckExprTrait
             return Type::NONE;
         }
         $class = $this->table->classByCode($ot);
+        // 枚举的隐式只读属性：->name / ->value（backed）
+        if ($class->isEnum && ($e->name === 'name' || $e->name === 'value')) {
+            if ($e->name === 'value' && $class->enumBacking === null) {
+                $this->error("纯枚举 {$class->name} 的 case 没有 ->value", $e->pos);
+                return Type::NONE;
+            }
+            return $e->name === 'name' ? Type::I_STRING : $class->enumBacking;
+        }
         $prop = $class->findProp($e->name);
         if ($prop === null) {
             $this->error("类 {$class->name} 没有属性 \${$e->name}", $e->pos);
@@ -1156,6 +1188,10 @@ trait CheckExprTrait
         $class = $this->table->classes[$e->class] ?? null;
         if ($class === null) {
             $this->error("未定义的类 '{$e->class}'", $e->pos);
+            return Type::NONE;
+        }
+        if ($class->isEnum) {
+            $this->error("枚举 '{$e->class}' 不能实例化（case 是唯一的实例）", $e->pos);
             return Type::NONE;
         }
         $ctor = $class->findMethod('__construct'); // 子类可继承父类构造器

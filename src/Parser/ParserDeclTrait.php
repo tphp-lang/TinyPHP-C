@@ -11,10 +11,12 @@ use Tphp\Ast\decl\ClassMethod;
 use Tphp\Ast\decl\ClassProp;
 use Tphp\Ast\decl\ConstDecl;
 use Tphp\Ast\decl\CStructDecl;
+use Tphp\Ast\decl\EnumDecl;
 use Tphp\Ast\decl\FunctionDecl;
 use Tphp\Ast\decl\InterfaceDecl;
 use Tphp\Ast\decl\InterfaceMethod;
 use Tphp\Ast\decl\Param;
+use Tphp\Ast\expr\IntLit;
 use Tphp\Token\Token;
 use Tphp\Token\TokenKind;
 
@@ -45,6 +47,11 @@ trait ParserDeclTrait
                 $decls[] = $this->parseCStructRest();
                 continue;
             }
+            if ($this->is(TokenKind::DirEnum)) {
+                $declared = true;
+                array_push($decls, ...$this->parseEnumRest());
+                continue;
+            }
             if ($this->is(TokenKind::DirExport)) {
                 $exportTok = $this->next();
                 if ($this->is(TokenKind::DirExport)) {
@@ -69,6 +76,11 @@ trait ParserDeclTrait
             if ($this->match(TokenKind::KwFunction)) {
                 $declared = true;
                 $decls[] = $this->parseFunctionRest();
+                continue;
+            }
+            if ($this->match(TokenKind::KwEnum)) {
+                $declared = true;
+                $decls[] = $this->parseEnumDecl();
                 continue;
             }
             if ($this->match(TokenKind::KwClass)) {
@@ -98,7 +110,6 @@ trait ParserDeclTrait
     }
 
     // ------------------------------------------------------------------ phpc 指令安全校验
-
     /**
      * #include 安全校验：`<...>` 系统头放行；`"..."` 相对路径必须停留在项目内。
      * （对齐 vlang：源文件不可通过指令触达构建机上的任意文件。）
@@ -200,6 +211,119 @@ trait ParserDeclTrait
             }
         }
         return !str_contains($p, '`');
+    }
+
+    /**
+     * 枚举类：enum Name [: int|string] [implements A, B] { case X [= lit]; ... 方法/常量 }。
+     * case = 单例对象（无自动赋值；backed 值必须显式且唯一）。
+     */
+    private function parseEnumDecl(): EnumDecl
+    {
+        $nameTok = $this->peek(); // 枚举名（'enum' 已由 parseTopLevel 消费）
+        $name = $this->expect(TokenKind::Ident, '枚举名')->lit;
+
+        $backing = null;
+        if ($this->match(TokenKind::Colon)) {
+            $backing = $this->parseTypeRef();
+        }
+
+        $implements = [];
+        if ($this->match(TokenKind::KwImplements)) {
+            do {
+                $implements[] = $this->resolveClassName($this->parseQualifiedName());
+            } while ($this->match(TokenKind::Comma));
+        }
+        $this->expect(TokenKind::Lbrace, "'{'");
+
+        $cases = [];
+        $methods = [];
+        $consts = [];
+        $seenCase = false;
+        while (!$this->is(TokenKind::Rbrace) && !$this->is(TokenKind::Eof)) {
+            // case X [= literal];
+            if ($this->match(TokenKind::KwCase)) {
+                $seenCase = true;
+                $cTok = $this->expect(TokenKind::Ident, 'case 名');
+                $value = null;
+                if ($this->match(TokenKind::Eq)) {
+                    $value = $this->parseUnary(); // 整数/字符串字面量（Checker 校验类型）
+                }
+                $this->expect(TokenKind::Semicolon, "';'");
+                $cases[] = ['name' => $cTok->lit, 'value' => $value, 'pos' => $cTok->pos];
+                continue;
+            }
+            if (!$seenCase && $this->is(TokenKind::KwPublic)) {
+                $this->errHere('case 必须出现在枚举体最前（PHP 语义）');
+                $this->next();
+                continue;
+            }
+            // 方法 / 常量：复用类成员解析
+            $vis = 'public';
+            if ($this->match(TokenKind::KwPublic)) {
+                $vis = 'public';
+            } elseif ($this->match(TokenKind::KwPrivate) || $this->match(TokenKind::KwProtected)) {
+                $this->errHere('枚举成员只能是 public');
+            }
+            $isStatic = $this->match(TokenKind::KwStatic);
+
+            if ($this->match(TokenKind::KwConst)) {
+                $typeRef = $this->parseTypeRef();
+                $cnameTok = $this->expect(TokenKind::Ident, '常量名');
+                $this->expect(TokenKind::Eq, "'='");
+                $value = $this->parseExpr();
+                $this->expect(TokenKind::Semicolon, "';'");
+                $cc = new ClassConstDecl($vis, $typeRef, $cnameTok->lit, $value);
+                $cc->pos = $typeRef->pos;
+                $consts[] = $cc;
+                continue;
+            }
+            $this->expect(TokenKind::KwFunction, "'function' 或 'case'");
+            $mnameTok = $this->expect(TokenKind::Ident, '方法名');
+            $params = $this->parseParamList();
+            $ret = $this->match(TokenKind::Colon) ? $this->parseTypeRef() : null;
+            $body = $this->parseBracedBlock();
+            $method = new ClassMethod($vis, $isStatic, $mnameTok->lit, $params, $ret, $body);
+            $method->pos = $mnameTok->pos;
+            $methods[] = $method;
+        }
+        $this->expect(TokenKind::Rbrace, "'}'");
+        $decl = new EnumDecl($name, $backing, $cases, $methods, $consts, $implements);
+        $decl->pos = $nameTok->pos;
+        return $decl;
+    }
+
+    /**
+     * #enum Name { A = 1, B }：C 枚举常量集。
+     * 解析期展开为合成的 c.i32 ConstDecl 列表（成员名 = 枚举名_成员名），
+     * Checker/Gen 走常量通道零改动；可显式赋值，缺省 = 前值 +1（C 语义）。
+     * @return list<ConstDecl>
+     */
+    private function parseEnumRest(): array
+    {
+        $this->expect(TokenKind::DirEnum, "'#enum'");
+        $nameTok = $this->expect(TokenKind::Ident, '枚举名');
+        $this->expect(TokenKind::Lbrace, "'{'");
+
+        $decls = [];
+        $next = 0;
+        while (!$this->is(TokenKind::Rbrace) && !$this->is(TokenKind::Eof)) {
+            $memberTok = $this->expect(TokenKind::Ident, '枚举成员名');
+            if ($this->match(TokenKind::Eq)) {
+                $valTok = $this->expect(TokenKind::IntLit, '枚举成员值');
+                $next = (int) $valTok->lit;
+            }
+            $lit = new IntLit((string) $next, $next);
+            $lit->pos = $memberTok->pos;
+            $cd = new ConstDecl($nameTok->lit . '_' . $memberTok->lit, null, $lit);
+            $cd->pos = $memberTok->pos;
+            $decls[] = $cd;
+            $next++;
+            if (!$this->match(TokenKind::Comma)) {
+                break;
+            }
+        }
+        $this->expect(TokenKind::Rbrace, "'}'");
+        return $decls;
     }
 
     /** #struct 体：#struct Name { c.u8 r; c.char* p; ... }（类型本体由头文件提供）。 */

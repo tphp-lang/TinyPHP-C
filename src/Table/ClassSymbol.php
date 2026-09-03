@@ -29,6 +29,25 @@ final class ClassSymbol
     /** @var list<string> vtable 中的方法名顺序 */
     public array $vtableOrder = [];
 
+    /** 枚举类：case 单例集（对象恒等、->name/->value 只读、from/tryFrom/cases 合成方法） */
+    public bool $isEnum = false;
+
+    /** 枚举 backing 类型码（I_INT / I_STRING）或 null（纯枚举） */
+    public ?int $enumBacking = null;
+
+    /** @var list<array{name: string, value: ?\Tphp\Ast\Expr}> 枚举 case */
+    public array $enumCases = [];
+
+    public function findEnumCase(string $name): ?array
+    {
+        foreach ($this->enumCases as $c) {
+            if ($c['name'] === $name) {
+                return $c;
+            }
+        }
+        return null;
+    }
+
     public function __construct(
         public readonly string $name,
         public readonly int $code,

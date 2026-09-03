@@ -14,6 +14,8 @@ int 整除、严格 bool 条件），表面语法保持 PHP 风格（`$` 变量�
 - 数字：十进制 / `0x` 十六进制 / `0b` 二进制 / `0o` 八进制；浮点含小数与指数部分
 - 字符串：单引号（仅 `\\` `\'` 转义）与双引号（`\n \r \t \v \f \0 \\ \$ \"` +
   `$var` / `{$expr}` 插值）
+- Heredoc / Nowdoc：`<<<EOT`（内容自下一行起到缩进 `EOT` 行，**支持插值**，等价双引号）；
+  `<<<'EOT'`（nowdoc，原文输出，无转义无插值，等价单引号）；结束行的 `;` 归还语句层
 - 不支持：`===` `!==` `<=>` `??` `?->` `@` `&$引用` `$$可变变量`
 
 ## 文法（EBNF 简写）
@@ -196,6 +198,35 @@ class Circle implements Shape { /* 必须实现全部方法，签名精确一致
 - 可与 `or` 块组合：`$x |> parse() or { ... }`
 - 优先级介于赋值与三元之间：`$y = $x |> f();` 无需括号；
   三元分支内使用管道需加括号
+
+### 枚举类（enum）
+
+PHP 8.1 语义的枚举类：case 是**单例对象**（`==` 即恒等），可带方法（`$this` 可用）、
+实现接口；backed 枚举（`: int` / `: string`）有只读 `->value`，**无自动赋值**
+（所有 case 必须显式赋值且值唯一）；`->name` 全枚举只读可用；
+合成静态方法 `cases()` / `from()`（无效值抛错）/ `tryFrom()`（无效值返回 null）。
+禁止：`new`、属性声明、`__construct`/`__destruct`。
+
+```php
+enum Suit: string implements HasColor
+{
+    case Hearts = 'H';
+    case Spades = 'S';
+
+    public function color(): string
+    {
+        return $this == Suit::Hearts ? "red" : "black";
+    }
+}
+
+Suit::Hearts->value;     // 'H'
+Suit::from('S');         // case 单例
+Suit::tryFrom('X');      // null
+Suit::cases();           // array<Suit> 按声明序
+```
+
+与 `#enum`（C 枚举常量集，值语义）分工：需要 case 行为/接口/恒等对象时用枚举类，
+与 C 头文件枚举交互时用 `c->成员` 或 `#enum`。
 
 ### 错误处理（or）
 

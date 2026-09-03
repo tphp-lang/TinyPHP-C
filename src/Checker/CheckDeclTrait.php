@@ -6,6 +6,7 @@ namespace Tphp\Checker;
 
 use Tphp\Ast\decl\ClassDecl;
 use Tphp\Ast\decl\ConstDecl;
+use Tphp\Ast\decl\EnumDecl;
 use Tphp\Ast\decl\FunctionDecl;
 use Tphp\Ast\decl\InterfaceDecl;
 use Tphp\Ast\Expr;
@@ -56,6 +57,7 @@ use Tphp\Table\VarSymbol;
 use Tphp\Token\Pos;
 use Tphp\Token\TokenKind;
 use Tphp\Type\Type;
+use Tphp\Gen\Names;
 
 /** 第一遍：收集符号（类 → 成员 → 函数），第二遍：检查函数体。 */
 trait CheckDeclTrait
@@ -416,6 +418,7 @@ trait CheckDeclTrait
             ownerClass: $sym,
             isStatic: $method->isStatic,
             isCtor: $method->name === '__construct',
+            isDtor: $method->name === '__destruct',
             vis: $method->vis,
         );
         $fn->ret = $method->ret !== null ? $this->resolveTypeRef($method->ret) : Type::I_VOID;
@@ -452,11 +455,143 @@ trait CheckDeclTrait
         }
     }
 
+    /** 枚举类：注册符号、校验 case（无自动赋值、值唯一）、注册方法/常量/接口与合成方法。 */
+    private function collectEnums(array $files): void
+    {
+        foreach ($files as $file) {
+            $prefix = $this->fqPrefix($file);
+            foreach ($file->decls as $decl) {
+                if (!$decl instanceof EnumDecl) {
+                    continue;
+                }
+                $fq = $prefix . $decl->name;
+                if (isset($this->table->classes[$fq])) {
+                    $this->error("类/枚举 '{$decl->name}' 重复定义", $decl->pos);
+                    continue;
+                }
+                $sym = new ClassSymbol($fq, $this->table->allocClassCode(), pos: $decl->pos);
+                $sym->isEnum = true;
+                if ($decl->backing !== null) {
+                    $backing = $this->resolveTypeRef($decl->backing);
+                    if ($backing !== Type::I_INT && $backing !== Type::I_STRING) {
+                        $this->error('枚举 backing 类型只能是 int 或 string', $decl->backing->pos);
+                        $backing = Type::I_INT;
+                    }
+                    $sym->enumBacking = $backing;
+                }
+                $this->table->addClass($sym);
+                $this->registerCSymbol(Names::classStruct($fq), $fq, $decl->pos);
+
+                $seen = [];
+                foreach ($decl->cases as $c) {
+                    if (isset($seen[$c['name']])) {
+                        $this->error("case '{$c['name']}' 重复定义", $c['pos']);
+                        continue;
+                    }
+                    $seen[$c['name']] = true;
+                    $value = $c['value'];
+                    if ($sym->enumBacking !== null) {
+                        if ($value === null) {
+                            $this->error("backed 枚举 case '{$c['name']}' 必须显式赋值（无自动赋值）", $c['pos']);
+                            continue;
+                        }
+                        $inner = $value instanceof UnaryExpr ? $value->expr : $value;
+                        $ok = $sym->enumBacking === Type::I_INT
+                            ? $inner instanceof IntLit
+                            : $inner instanceof StrLit;
+                        if (!$ok) {
+                            $this->error('case 值必须是与 backing 匹配的字面量（int → 整数，string → 单引号字符串）', $c['pos']);
+                            continue;
+                        }
+                        // 值唯一性（按字面量文本归一）
+                        $vt = $sym->enumBacking === Type::I_INT ? $inner->value : $inner->value;
+                        if (in_array($vt, array_column($sym->enumCases, 'v'), true)) {
+                            $this->error("case 值 {$vt} 与既有 case 重复", $c['pos']);
+                            continue;
+                        }
+                        $sym->enumCases[] = ['name' => $c['name'], 'value' => $value, 'v' => $vt];
+                    } else {
+                        if ($value !== null) {
+                            $this->error('纯枚举 case 不能赋值', $c['pos']);
+                            continue;
+                        }
+                        $sym->enumCases[] = ['name' => $c['name'], 'value' => null];
+                    }
+                }
+                if ($sym->enumBacking !== null && $sym->enumCases === []) {
+                    $this->error("backed 枚举 '{$decl->name}' 至少需要一个 case", $decl->pos);
+                }
+
+                // 方法 / 常量（复用类通道；: self 返回等特性自动可用）
+                $this->curClass = $sym;
+                foreach ($decl->consts as $cc) {
+                    $this->registerClassConst($sym, $cc);
+                }
+                foreach ($decl->methods as $method) {
+                    if ($method->name === '__construct' || $method->name === '__destruct') {
+                        $this->error("枚举不能声明 {$method->name}", $method->pos);
+                        continue;
+                    }
+                    $this->registerMethod($sym, $method);
+                }
+                // 合成静态方法：cases()（全部枚举）；from/tryFrom（backed）
+                $casesRet = $this->table->arrayOf($sym->code);
+                $casesFn = new FnSymbol('cases', null, isMethod: true, ownerClass: $sym, isStatic: true);
+                $casesFn->ret = $casesRet;
+                $sym->methods['cases'] = $casesFn;
+                if ($sym->enumBacking !== null) {
+                    $from = new FnSymbol('from', null, isMethod: true, ownerClass: $sym, isStatic: true);
+                    $from->ret = $sym->code;
+                    $from->params[] = new ParamSymbol($sym->enumBacking, 'value');
+                    $sym->methods['from'] = $from;
+                    $tryFrom = new FnSymbol('tryFrom', null, isMethod: true, ownerClass: $sym, isStatic: true);
+                    $tryFrom->ret = $sym->code;
+                    $tryFrom->params[] = new ParamSymbol($sym->enumBacking, 'value');
+                    $sym->methods['tryFrom'] = $tryFrom;
+                }
+                foreach ($decl->implements as $ifaceName) {
+                    $iface = $this->table->ifaces[$ifaceName] ?? null;
+                    if ($iface === null) {
+                        $this->error("接口 '{$ifaceName}' 不存在", $decl->pos);
+                        continue;
+                    }
+                    $sym->implements[] = $iface;
+                }
+                $this->buildVtable($sym);
+                $this->curClass = null;
+            }
+        }
+
+        // 枚举的接口校验（与类同一规则）
+        foreach ($files as $file) {
+            $prefix = $this->fqPrefix($file);
+            foreach ($file->decls as $decl) {
+                if (!$decl instanceof EnumDecl) {
+                    continue;
+                }
+                $sym = $this->table->classes[$prefix . $decl->name];
+                $this->validateImplements($sym);
+            }
+        }
+    }
+
     /** vtable 顺序：父类方法在前（保持前缀布局），本类新增方法追加在后。 */
     private function buildVtable(ClassSymbol $sym): void
     {
         $order = $sym->parent !== null ? $sym->parent->vtableOrder : [];
         foreach ($sym->methods as $name => $fn) {
+            if ($fn->isDtor) {
+                if ($fn->isStatic) {
+                    $this->error('__destruct 不能是 static', $fn->pos);
+                }
+                if ($fn->params !== []) {
+                    $this->error('__destruct 不能有参数', $fn->pos);
+                }
+                if (!$this->table->isVoid($fn->ret)) {
+                    $this->error('__destruct 返回类型必须是 void', $fn->pos);
+                }
+                continue; // 不进 vtable（仅由运行时析构路径调用）
+            }
             if (!$fn->isStatic && !$fn->isCtor && !in_array($name, $order, true)) {
                 $order[] = $name;
             }
@@ -559,6 +694,18 @@ trait CheckDeclTrait
                     continue;
                 }
                 if ($decl instanceof ClassDecl) {
+                    $sym = $this->table->classes[$this->fqPrefix($file) . $decl->name];
+                    $this->curClass = $sym;
+                    foreach ($decl->methods as $method) {
+                        $fn = $sym->methods[$method->name] ?? null;
+                        if ($fn === null) {
+                            continue;
+                        }
+                        $this->checkFnBody($fn, $method->body);
+                    }
+                    $this->curClass = null;
+                }
+                if ($decl instanceof EnumDecl) {
                     $sym = $this->table->classes[$this->fqPrefix($file) . $decl->name];
                     $this->curClass = $sym;
                     foreach ($decl->methods as $method) {

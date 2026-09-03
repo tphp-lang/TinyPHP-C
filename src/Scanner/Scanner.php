@@ -196,6 +196,81 @@ final class Scanner
         $this->tokens[] = new Token(TokenKind::DirExport, $name, $start);
     }
 
+    /**
+     * Heredoc / Nowdoc（<<<Label / <<<'Label'）。
+     * 内容自下一行起，到以 Label 开头（允许缩进）的行结束；
+     * heredoc → DStrLit（支持插值），nowdoc → NowdocLit（原文，无转义处理）。
+     */
+    private function scanHeredoc(Pos $start): void
+    {
+        $label = '';
+        while (!$this->eof() && (ctype_alpha($this->peek()) || $this->peek() === '_')) {
+            $label .= $this->step();
+        }
+        $nowdoc = false;
+        if ($this->peek() === "'") {
+            $this->step();
+            $label = '';
+            while (!$this->eof() && (ctype_alpha($this->peek()) || $this->peek() === '_')) {
+                $label .= $this->step();
+            }
+            if ($this->peek() !== "'") {
+                $this->error("nowdoc 终止引号缺失：<<<'{$label}");
+                return;
+            }
+            $this->step();
+            $nowdoc = true;
+        } elseif ($this->peek() === '"') {
+            $this->step(); // <<"Label" 形式 = heredoc
+        }
+        if ($label === '') {
+            $this->error('heredoc 缺少标签：<<< 后应为标识符');
+            return;
+        }
+        // 开标签行剩余内容必须为空白
+        while (!$this->eof() && ($this->peek() === ' ' || $this->peek() === "\t" || $this->peek() === "\r")) {
+            $this->step();
+        }
+        if (!$this->eof() && $this->peek() !== "\n") {
+            $this->error('heredoc 开标签行尾只允许空白');
+            return;
+        }
+        if (!$this->eof()) {
+            $this->step(); // 行尾
+        }
+        // 收集行直到 label 行（允许缩进；label 后的 `;` 归还给语句层）
+        $lines = [];
+        $closed = false;
+        $closeSemi = false;
+        while (!$this->eof()) {
+            $lineStart = $this->i;
+            while (!$this->eof() && $this->peek() !== "\n") {
+                $this->step();
+            }
+            $line = rtrim(substr($this->src, $lineStart, $this->i - $lineStart), "\r");
+            if (!$this->eof()) {
+                $this->step(); // 行尾
+            }
+            $bare = ltrim($line);
+            if (rtrim($bare, "; \t") === $label) {
+                $closed = true;
+                $closeSemi = str_ends_with(rtrim($bare), ';');
+                break;
+            }
+            $lines[] = $line;
+        }
+        if (!$closed) {
+            $this->error("heredoc 未终止：缺少 {$label} 结束行");
+            return;
+        }
+        // 先内容（pos = 开标签处），后结束行的 `;`（归还给语句层）
+        $content = implode("\n", $lines);
+        $this->tokens[] = new Token($nowdoc ? TokenKind::NowdocLit : TokenKind::DStrLit, $content, $start);
+        if ($closeSemi) {
+            $this->tokens[] = new Token(TokenKind::Semicolon, ';', $this->here());
+        }
+    }
+
     private function skipTrivia(): void
     {
         while (!$this->eof()) {
@@ -224,6 +299,13 @@ final class Scanner
                     $this->step(); // #
                     $this->takeWhile(fn ($ch) => ctype_alpha($ch)); // 吃掉 "struct"
                     $this->tokens[] = new Token(TokenKind::DirStruct, '#struct', $this->here());
+                    $this->takeWhile(fn ($ch) => $ch === ' ' || $ch === "\t");
+                    continue; // 之后的标识符/花括号走正常 token 流
+                }
+                if ($this->lineHasOnlyWs && $this->matchDirectiveKeyword('enum')) {
+                    $this->step(); // #
+                    $this->takeWhile(fn ($ch) => ctype_alpha($ch)); // 吃掉 "enum"
+                    $this->tokens[] = new Token(TokenKind::DirEnum, '#enum', $this->here());
                     $this->takeWhile(fn ($ch) => $ch === ' ' || $ch === "\t");
                     continue; // 之后的标识符/花括号走正常 token 流
                 }
@@ -436,6 +518,12 @@ final class Scanner
             $this->emit(TokenKind::Ellipsis, $start);
             return;
         }
+        if ($c === '<' && $c2 === '<' && $c3 === '<') {
+            $this->step(); // 第二个 <
+            $this->step(); // 第三个 <
+            $this->scanHeredoc($start);
+            return;
+        }
         if ($c === '@' || $c === '`') {
             $this->error("意外的字符 '{$c}'");
             return;
@@ -551,6 +639,8 @@ final class Scanner
             'const' => TokenKind::KwConst,
             'extends' => TokenKind::KwExtends,
             'interface' => TokenKind::KwInterface,
+            'enum' => TokenKind::KwEnum,
+            'case' => TokenKind::KwCase,
             'implements' => TokenKind::KwImplements,
             'namespace' => TokenKind::KwNamespace,
             'use' => TokenKind::KwUse,

@@ -396,6 +396,9 @@ trait ParserExprTrait
             case TokenKind::StrLit:
                 $this->next();
                 return $this->at(new StrLit($this->resolveSingleQuoted($t->lit)), $t->pos);
+            case TokenKind::NowdocLit:
+                $this->next();
+                return $this->at(new StrLit($t->lit), $t->pos); // nowdoc：原文，无转义处理
             case TokenKind::DStrLit:
                 $this->next();
                 return $this->parseInterpolated($t);

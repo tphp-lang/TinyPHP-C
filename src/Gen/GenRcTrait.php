@@ -9,6 +9,7 @@ use Tphp\Ast\expr\ArrayLit;
 use Tphp\Ast\expr\CallExpr;
 use Tphp\Ast\expr\MethodCall;
 use Tphp\Ast\expr\NewExpr;
+use Tphp\Ast\expr\StaticCall;
 use Tphp\Table\FnSymbol;
 use Tphp\Table\VarSymbol;
 use Tphp\Type\Type;
@@ -39,7 +40,7 @@ trait GenRcTrait
             || $this->table->isInterface($code);
     }
 
-    /** 是否堆值产生式（new / 函数与方法调用 / 数组字面量）。 */
+    /** 是否堆值产生式（new / 函数与方法调用 / 静态方法调用 / 数组字面量）。 */
     private function isFreshProducer(Expr $e): bool
     {
         if ($e instanceof NewExpr || $e instanceof ArrayLit) {
@@ -49,6 +50,9 @@ trait GenRcTrait
             return $e->name !== 'len' && $e->name !== 'var_dump' && $this->isHeapType($e->type);
         }
         if ($e instanceof MethodCall) {
+            return $this->isHeapType($e->type);
+        }
+        if ($e instanceof StaticCall) {
             return $this->isHeapType($e->type);
         }
         return false;

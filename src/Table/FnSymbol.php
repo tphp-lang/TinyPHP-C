@@ -34,5 +34,6 @@ final class FnSymbol
         public int $ret = 0,
         public bool $isBuiltin = false,
         public bool $isDefined = true,
+        public bool $isDtor = false, // __destruct 用户析构（对象引用归零时先于字段释放调用）
     ) {}
 }

@@ -5,12 +5,14 @@ declare(strict_types=1);
 namespace Tphp\Gen;
 
 use Tphp\Ast\decl\ClassDecl;
+use Tphp\Ast\decl\EnumDecl;
 use Tphp\Ast\decl\FunctionDecl;
 use Tphp\Ast\File;
 use Tphp\Table\ClassSymbol;
 use Tphp\Table\FnSymbol;
 use Tphp\Table\InterfaceSymbol;
 use Tphp\Table\VarSymbol;
+use Tphp\Type\Type;
 
 /** 声明生成：类型/全局/原型/函数体/入口 main。 */
 trait GenDeclTrait
@@ -41,6 +43,18 @@ trait GenDeclTrait
                     continue;
                 }
                 if ($decl instanceof ClassDecl) {
+                    $class = $this->table->classes[$prefix . $decl->name] ?? null;
+                    if ($class === null) {
+                        continue;
+                    }
+                    foreach ($decl->methods as $method) {
+                        $fn = $class->methods[$method->name] ?? null;
+                        if ($fn !== null) {
+                            $items[] = [$fn, $method->body, $class];
+                        }
+                    }
+                }
+                if ($decl instanceof EnumDecl) {
                     $class = $this->table->classes[$prefix . $decl->name] ?? null;
                     if ($class === null) {
                         continue;
@@ -299,6 +313,19 @@ trait GenDeclTrait
         $this->w('struct ' . $struct . ' {');
         $this->indent = 1;
         $this->w('TPHP_OBJECT_HEAD');
+        if ($class->isEnum) {
+            // 枚举 case：name（全部）+ value（backed）；均为 .rodata 字面量，无堆字段
+            $this->w('String name;');
+            if ($class->enumBacking === Type::I_STRING) {
+                $this->w('String value;');
+            } elseif ($class->enumBacking === Type::I_INT) {
+                $this->w('int32_t value;');
+            }
+            $this->indent = 0;
+            $this->w('};');
+            $this->w('');
+            return;
+        }
         // 字段平铺：继承字段按基类优先顺序展开（前缀布局与父类兼容）
         $chain = [];
         for ($c = $class; $c !== null; $c = $c->parent) {
@@ -410,6 +437,21 @@ trait GenDeclTrait
             $this->w('');
             $this->w('/* ---- 对象构造辅助 ---- */');
             foreach ($classes as $class) {
+                if ($class->isEnum) {
+                    $init = Names::method($class->name, '__enum_init');
+                    $this->w('static void ' . $init . '(void);');
+                    foreach ($class->enumCases as $c) {
+                        $this->w('static ' . Names::classStruct($class->name) . '* tphp_e_' . Names::mangle($class->name) . '_' . $c['name'] . ';');
+                    }
+                    $struct = Names::classStruct($class->name);
+                    if ($class->enumBacking !== null) {
+                        $backC = $class->enumBacking === Type::I_STRING ? 'String' : 'int32_t';
+                        $this->w('static ' . $struct . '* ' . Names::method($class->name, 'from') . '(' . $backC . ' value);');
+                        $this->w('static ' . $struct . '* ' . Names::method($class->name, 'tryFrom') . '(' . $backC . ' value);');
+                    }
+                    $this->w('static Array* ' . Names::method($class->name, 'cases') . '(void);');
+                    continue;
+                }
                 $this->w($this->newHelperSignature($class) . ';');
             }
             // vtable 实例必须在全部方法原型之后（静态初始化器引用函数地址）
@@ -463,10 +505,124 @@ trait GenDeclTrait
         }
         foreach ($this->classesTopo() as $class) {
             $this->curFile = $class->pos?->file ?? '';
+            if ($class->isEnum) {
+                $this->genEnumMembers($class);
+                continue;
+            }
             $this->genNewHelper($class);
         }
         // dump 组合函数在正文生成时被发现，这里统一落到 helpers 节
         $this->drainDumps();
+    }
+
+    /** 枚举成员生成：case 单例 init、from/tryFrom/cases 合成静态方法。 */
+    private function genEnumMembers(ClassSymbol $class): void
+    {
+        $struct = Names::classStruct($class->name);
+        $init = Names::method($class->name, '__enum_init');
+        $ready = 'tphp_enum_ready_' . Names::mangle($class->name);
+        $this->sections['globals'] .= 'static bool ' . $ready . " = false;\n";
+        $this->w('static void ' . $init . '(void)');
+        $this->w('{');
+        $this->indent = 1;
+        $this->w('if (' . $ready . ') {');
+        $this->indent = 2;
+        $this->w('return;');
+        $this->indent = 1;
+        $this->w('}');
+        foreach ($class->enumCases as $c) {
+            $ptr = 'tphp_e_' . Names::mangle($class->name) . '_' . $c['name'];
+            $this->w('{');
+            $this->indent = 1;
+            $this->w($struct . '* o = (' . $struct . '*)tphp_object_alloc_static(sizeof(' . $struct . '), NULL, NULL);');
+            $this->w('o->name = ' . $this->strLitExpr($c['name']) . ';');
+            if ($class->enumBacking === Type::I_STRING) {
+                $v = $c['value'];
+                $bytes = $v instanceof \Tphp\Ast\expr\StrLit ? $v->value : '';
+                $this->w('o->value = ' . $this->strLitExpr($bytes) . ';');
+            } elseif ($class->enumBacking === Type::I_INT) {
+                $v = $c['value'];
+                $ival = 0;
+                if ($v instanceof \Tphp\Ast\expr\IntLit) {
+                    $ival = $v->value;
+                } elseif ($v instanceof \Tphp\Ast\expr\UnaryExpr && $v->expr instanceof \Tphp\Ast\expr\IntLit) {
+                    $ival = -$v->expr->value;
+                }
+                $this->w('o->value = ' . $ival . ';');
+            }
+            $this->w($ptr . ' = o;');
+            $this->indent = 0;
+            $this->w('}');
+        }
+        $this->w($ready . ' = true;');
+        $this->indent = 0;
+        $this->w('}');
+        $this->w('');
+
+        // case 引用原型（protos 节已声明指针；此处生成 getter 复合表达式由调用点内联）
+        // from/tryFrom/cases 合成静态方法
+        $this->genEnumFrom($class, true);
+        $this->genEnumFrom($class, false);
+        $this->genEnumCases($class);
+        $this->w('');
+    }
+
+    /** from（找不到抛错）/ tryFrom（找不到返回 null）。 */
+    private function genEnumFrom(ClassSymbol $class, bool $throwing): void
+    {
+        if ($class->enumBacking === null || $class->enumCases === []) {
+            return;
+        }
+        $struct = Names::classStruct($class->name);
+        $fn = Names::method($class->name, $throwing ? 'from' : 'tryFrom');
+        $init = Names::method($class->name, '__enum_init');
+        $backC = $class->enumBacking === Type::I_STRING ? 'String' : 'int32_t';
+        $this->w('static ' . $struct . '* ' . $fn . '(' . $backC . ' value)');
+        $this->w('{');
+        $this->indent = 1;
+        $this->w($init . '();');
+        $cmp = static fn (string $a, string $b): string => $class->enumBacking === Type::I_STRING
+            ? 'tphp_str_eq(' . $a . ', ' . $b . ')'
+            : '((' . $a . ') == (' . $b . '))';
+        foreach ($class->enumCases as $c) {
+            $ptr = 'tphp_e_' . Names::mangle($class->name) . '_' . $c['name'];
+            $v = $c['value'];
+            $lit = $class->enumBacking === Type::I_STRING
+                ? $this->strLitExpr($v instanceof \Tphp\Ast\expr\StrLit ? $v->value : '')
+                : (string) ($v instanceof \Tphp\Ast\expr\IntLit ? $v->value
+                    : ($v instanceof \Tphp\Ast\expr\UnaryExpr && $v->expr instanceof \Tphp\Ast\expr\IntLit ? -$v->expr->value : 0));
+            $this->w('if (' . $cmp('value', $lit) . ') { return ' . $ptr . '; }');
+        }
+        if ($throwing) {
+            $this->w('tphp_err_set(tphp_str_lit("ValueError: not a valid enum value", 33));');
+            $this->w('return NULL;');
+        } else {
+            $this->w('return NULL;');
+        }
+        $this->indent = 0;
+        $this->w('}');
+        $this->w('');
+    }
+
+    /** cases()：每次调用返回新建数组（owned，调用方持有；单例引用计数不灭）。 */
+    private function genEnumCases(ClassSymbol $class): void
+    {
+        $struct = Names::classStruct($class->name);
+        $init = Names::method($class->name, '__enum_init');
+        $fn = Names::method($class->name, 'cases');
+        $this->w('static Array* ' . $fn . '(void)');
+        $this->w('{');
+        $this->indent = 1;
+        $this->w($init . '();');
+        $this->w('Array* a = tphp_arr_new(sizeof(' . $struct . '*), ' . max(4, count($class->enumCases)) . ', TPHP_ELEM_OBJECT);');
+        foreach ($class->enumCases as $c) {
+            $ptr = 'tphp_e_' . Names::mangle($class->name) . '_' . $c['name'];
+            $this->w('a = tphp_arr_push(a, &' . $ptr . ');');
+        }
+        $this->w('return a;');
+        $this->indent = 0;
+        $this->w('}');
+        $this->w('');
     }
 
     /** @param list<object> $body */
@@ -553,12 +709,17 @@ trait GenDeclTrait
         // 含堆字段的类生成析构（对象引用计数归零时释放其持有的数组/对象/接口）
         $heapFields = $this->heapFieldsOf($class);
         $dtorName = 'NULL';
-        if ($heapFields !== []) {
+        $userDtor = $class->methods['__destruct'] ?? null;
+        if ($heapFields !== [] || $userDtor !== null) {
             $dtorName = Names::method($class->name, '__dtor');
             $this->w('static void ' . $dtorName . '(void *p)');
             $this->w('{');
             $this->indent = 1;
             $this->w($struct . ' *self = (' . $struct . ' *)p;');
+            if ($userDtor !== null) {
+                // 用户析构先于字段释放（PHP 语义）
+                $this->w(Names::method($userDtor->ownerClass->name, '__destruct') . '(self);');
+            }
             foreach ($heapFields as $field) {
                 $this->w($this->fieldUnrefStmt('self->' . $field['name'], $field['type']));
             }

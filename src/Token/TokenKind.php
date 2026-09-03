@@ -23,12 +23,14 @@ enum TokenKind
     case DirElse;     // #else
     case DirEndif;    // #endif
     case DirExport;   // #[export("c_name")]（lit 为 C 符号名，仅全局函数）
+    case DirEnum;     // #enum Name { A = 1, B }（C 枚举常量集，成员注册为 c.i32 常量）
 
     // 字面量与名字
     case IntLit;
     case FloatLit;
     case StrLit;      // '...' 单引号，原始内容
     case DStrLit;     // "..." 双引号，原始内容（可能含插值）
+    case NowdocLit;   // <<<'EOT' nowdoc，原文内容（无转义、无插值）
     case Ident;       // 名字（函数/类/类型别名 c.*）
     case Var;         // $name
 
@@ -55,6 +57,7 @@ enum TokenKind
     case KwConst;
     case KwExtends;
     case KwInterface;
+    case KwEnum;      // enum Name [: int|string] { case X = v; ... } 枚举类（KwCase 复用 switch 的 case）
     case KwImplements;
     case KwNamespace;
     case KwUse;

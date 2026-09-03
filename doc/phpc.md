@@ -65,6 +65,35 @@ function platTag(): string { return "x64"; }
 - 支持嵌套；`#if` 缺 `#endif` 编译报错
 - 未命中分支的语法错误不影响编译（整段跳过，不解析）
 
+## 一·七、C 枚举
+
+**引用 C 头文件里的枚举（无需声明）**：枚举成员就是整型常量，`c->成员名` 直连引用
+（与 C 宏常量同一机制），由 C 编译器解析。返回 CVAL——落变量须显式 C 类型声明：
+
+```php
+#include "raylib.h"
+
+c.i32 $r = c->FLAG_RECT;           // 枚举成员
+c.i32 $mix = c->FLAG_RECT | c->FLAG_ROUND;  // 位运算组合（CVAL 混入，结果 CVAL）
+echo c->KEY_ENTER == 257, "\n";    // 与字面量比较
+switch ($v) { case c->KEY_A: ... } // switch 分发
+c->draw_circle($x, $y, $r, c->RED); // 直接作为 c-> 调用实参
+```
+
+**TinyPHP 侧自定义常量集（#enum）**：不需要 C 头文件时，用 `#enum` 定义等价的
+常量集（成员名 = `枚举名_成员名`，类型 c.i32，生成 `#define`）：
+
+```php
+#enum Color {
+    RED = 1,
+    GREEN,      // = 2（缺省 = 前值 + 1，C 语义）
+    BLUE = 4,
+}
+```
+
+- `#enum` 显式赋值必须为整数字面量；重复成员名 / 与其他常量冲突报编译错
+- 两侧互通：C 枚举成员与 `#enum` 常量可混入同一表达式（均为 c.i32/CVAL）
+
 ## 一·六、库模式导出（`#[export]` 注解）
 
 `--shared` / `--no-main` 库模式下，全局函数与 `tphp_new_<Class>` 以非 static 的

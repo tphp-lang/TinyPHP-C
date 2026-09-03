@@ -724,7 +724,10 @@ trait GenExprTrait
     {
         // 内置函数
         if ($e->name === 'len') {
-            $arg = $this->genExpr($e->args[0]);
+            // 新鲜堆值实参先入临时（len 不持有，语句尾释放）
+            $arg = $this->isFreshProducer($e->args[0]) && $this->isHeapType($e->args[0]->type)
+                ? $this->rcHoist($e->args[0])
+                : $this->genExpr($e->args[0]);
             return $e->args[0]->type === Type::I_STRING
                 ? '((' . $arg . ').length)'
                 : 'tphp_len_arr(' . $arg . ')';
@@ -1030,6 +1033,13 @@ trait GenExprTrait
     /** 类常量宏名（按声明类解析，self/parent 归属到声明处）。 */
     private function genStaticConstName(StaticConst $e): string
     {
+        // 枚举 case：惰性初始化后返回单例指针（自持有，进程期存活）
+        if ($e->isEnumCase) {
+            $class = $this->resolveClass($e->class);
+            $init = Names::method($class->name, '__enum_init');
+            $ptr = 'tphp_e_' . Names::mangle($class->name) . '_' . $e->name;
+            return '({ ' . $init . '(); ' . $ptr . '; })';
+        }
         $recv = $this->resolveClass($e->class);
         for ($c = $recv; $c !== null; $c = $c->parent) {
             if (isset($c->consts[$e->name])) {
