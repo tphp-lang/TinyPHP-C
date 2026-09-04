@@ -313,19 +313,19 @@ int $w = divide(1, 0) or { echo err; 0 }; // err = 错误消息（string，只�
 ## 编译器
 
 ```bash
-php main.php <file.php> [more.php ...] [-o out] [--emit-c] [--run]
-            [--cc=tcc|gcc|clang] [-os windows|linux] [-arch x86_64|i386|arm64]
-            [--no-main] [--shared] [--cflag=<arg> ...]
+php main.php [build|run|shared] <file.php | .> [more.php ...] [-o out] [--emit-c]
+            [--cc tcc|gcc|clang] [-os windows|linux] [-arch x86_64|i386|arm64]
+            [--no-main] [--cflag <arg> ...]
 php tests/run.php           # 测试架（单文件 + 多文件用例）
 php tests/cross.php         # 交叉编译测试（windows x86_64/i386、linux x86_64/arm64）
 ```
 
+- 命令缺省 = `build`；`run` 编译后立即运行（仅本机目标）；`shared` 编译为动态库（.dll/.so），隐含 `--no-main`
 - 目标默认**本机系统 + 本机架构**；只传 `-os` 时架构默认 `x86_64`
 - `-os` / `-arch`：目标平台，由自带 TCC 的交叉二进制支持
   （Linux 产物为 musl 静态 ELF，不依赖目标机 libc）
 - `--no-main`：不生成 `main()`，供固件工程或宿主程序以库形式集成
-- `--shared`：编译为动态库（.dll/.so），隐含 `--no-main`
-- `--cflag=`：向 C 编译器透传参数（可多次），gcc/clang 交叉工具链由此接线
+- `--cflag <arg>`：向 C 编译器透传参数（可多次），gcc/clang 交叉工具链由此接线
 
 流水线：
 

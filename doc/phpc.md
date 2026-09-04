@@ -35,7 +35,7 @@ TinyPHP 直接调用 C 函数（libc / 系统 API / 第三方库）：声明式�
 - `#flag` 拒绝：反引号与 shell 元字符、`..` 路径、盘符绝对路径、**其余一切编译器标志**
   （`-B`/`-specs`/`-wrapper`/`--include`/`-imacros`/`-Xlinker` 等可让构建机
   执行任意文件的选项被白名单天然挡下）
-- 构建者自身的可信参数走 CLI `--cflag=`（不经此校验）
+- 构建者自身的可信参数走 CLI `--cflag <arg>`（不经此校验）
 - `#flag` 引用的 `.c` 文件在编译前校验存在性
 
 ## 一·五、平台条件编译（#if / #elif / #else / #endif）
@@ -96,7 +96,7 @@ c->draw_circle($x, $y, $r, c->RED); // 直接作为 c-> 调用实参
 
 ## 一·六、库模式导出（`#[export]` 注解）
 
-`--shared` / `--no-main` 库模式下，全局函数与 `tphp_new_<Class>` 以非 static 的
+`shared` 命令 / `--no-main` 库模式下，全局函数与 `tphp_new_<Class>` 以非 static 的
 C 符号导出，宿主程序可直接声明并调用。`#[export("c_name")]` 注解为全局函数
 指定自定义 C 符号名（仅顶层 function 有效，标注类成员/接口成员报编译错）：
 
@@ -119,7 +119,7 @@ function add(int $a, int $b): int
 
 - windows（.dll）：PE 默认不导出普通符号，编译器自动追加 `-Wl,--export-all-symbols`
 - linux（.so）：自带 musl 交叉 tcc 的 `-shared` 产物不含动态符号表，
-  需要可按符号加载的 .so 时，请在 Linux 宿主上用 `--cc=gcc/clang`
+  需要可按符号加载的 .so 时，请在 Linux 宿主上用 `--cc gcc`
 
 ## 二、`c->` 直连（C 函数调用 / C 常量引用，无需声明）
 

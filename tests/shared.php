@@ -3,9 +3,9 @@
 declare(strict_types=1);
 
 /**
- * 库模式测试：--shared 产物 + #[export("c_add")] 自定义符号导出。
+ * 库模式测试：shared 命令产物 + #[export("c_add")] 自定义符号导出。
  *
- *   1) --shared 编译 tests/shared/demo.php → 动态库（本机 .dll / linux .so）
+ *   1) shared 编译 tests/shared/demo.php → 动态库（本机 .dll / linux .so）
  *   2) Windows：TCC 编译 host.c（LoadLibrary），加载动态库按 c_add 调用，
  *      并校验默认符号 tphp_add 已被 #[export] 重命名而消失
  *   3) Linux 目标：校验 ELF 魔数与导出符号名（静态检查）
@@ -38,11 +38,11 @@ function check(string $name, bool $ok, string $detail = ''): bool
     return $ok;
 }
 
-// ---- 1) 本机 --shared 编译 ----
+// ---- 1) 本机 shared 命令编译 ----
 $dll = $outDir . '/' . (PHP_OS_FAMILY === 'Windows' ? 'demo.dll' : 'demo.so');
 @unlink($dll);
 $build = shell_exec(escapeshellarg($php) . ' ' . escapeshellarg($root . '/main.php')
-    . ' ' . escapeshellarg($demo) . ' --shared -o ' . escapeshellarg($dll) . ' 2>&1');
+    . ' shared ' . escapeshellarg($demo) . ' -o ' . escapeshellarg($dll) . ' 2>&1');
 if (!check('shared 编译（本机动态库）', is_file($dll), (string) $build)) {
     exit(1);
 }
@@ -66,7 +66,7 @@ if (PHP_OS_FAMILY === 'Windows') {
 $so = $outDir . '/demo.so';
 @unlink($so);
 $build = shell_exec(escapeshellarg($php) . ' ' . escapeshellarg($root . '/main.php')
-    . ' ' . escapeshellarg($demo) . ' --shared -os linux -arch x86_64 -o ' . escapeshellarg($so) . ' 2>&1');
+    . ' shared ' . escapeshellarg($demo) . ' -os linux -arch x86_64 -o ' . escapeshellarg($so) . ' 2>&1');
 check('linux .so 为 ELF 产物', is_file($so) && str_starts_with((string) file_get_contents($so), "\x7fELF"), (string) $build);
 
 echo "\n{$pass} 通过, {$fail} 失败\n";

@@ -122,6 +122,7 @@ trait GenClosureTrait
         $this->indent = 1;
         $this->curRet = $e->sig['ret'];
         $this->curClassSym = null;
+        $this->rcScopes = []; // thunk 的 RC 栈独立（否则 rcCleanupReturn 会清理外层函数的变量）
         $this->rcScopeBegin('closure');
         $this->w('size_t __cmem = tphp_cmem_mark();');
         foreach ($e->sig['params'] as $i => $pt) {

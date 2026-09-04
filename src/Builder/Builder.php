@@ -85,7 +85,8 @@ final class Builder
 
         // 输出路径：可执行文件/动态库默认当前目录（根目录）；C 源码默认放 build/ 目录。
         // -o 显式指定输出路径时，C 源码与产物同目录。
-        $base = pathinfo($this->pref->inputs[0], PATHINFO_FILENAME);
+        // 命名用入口文件（含全局 class Main 的文件；`.` 展开等场景下与参数顺序无关）。
+        $base = pathinfo($this->pref->inputs[$entryIndex ?? 0], PATHINFO_FILENAME);
         if ($this->pref->shared) {
             $exePath = $this->pref->output ?? $base . ($this->pref->os === 'windows' ? '.dll' : '.so');
         } else {
@@ -107,7 +108,7 @@ final class Builder
         $emitC = $this->pref->emitC;
         if ($this->pref->noMain && !$this->pref->shared && !$emitC) {
             // 库模式没有 main，无法链接可执行文件：退回只输出 C
-            echo "提示：--no-main 未生成 main()，仅输出 C 源码（可加 --shared 生成动态库）\n";
+            echo "提示：--no-main 未生成 main()，仅输出 C 源码（可加 shared 命令生成动态库）\n";
             $emitC = true;
         }
         if ($emitC) {
@@ -162,7 +163,7 @@ final class Builder
         return $sources;
     }
 
-    /** --run 仅对本机目标可用。 */
+    /** run 命令仅对本机目标可用。 */
     private function canRunHere(): bool
     {
         $hostOs = strtolower(PHP_OS_FAMILY); // windows / linux / darwin

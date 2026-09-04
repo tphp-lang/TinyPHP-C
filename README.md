@@ -38,7 +38,7 @@ function parse(): int
 ```
 
 ```console
-$ php main.php hello.php --run
+$ php main.php run hello.php
 生成 C 源码: build/hello.c
 > tcc -o hello.exe -I runtime build/hello.c
 编译完成: hello.exe
@@ -49,13 +49,15 @@ Uncaught error: not ready
 ## 快速开始
 
 要求：PHP >= 8.4（运行编译器）、项目自带 TCC（作为 C 后端）。
+编译指令详见 `doc/compiler.md`。
 
 ```bash
-php main.php examples/01_hello.php --run     # 编译并运行（exe 在当前目录，C 源码在 build/）
-php main.php examples/04_class.php           # 只编译出 04_class.exe（当前目录）
-php main.php examples/02_control.php --emit-c# 只生成 C 源码（build/ 目录，可直接阅读）
+php main.php run examples/01_hello.php       # 编译并运行（exe 在当前目录，C 源码在 build/）
+php main.php build examples/04_class.php     # 只编译出 04_class.exe（当前目录）
+php main.php build examples/02_control.php --emit-c   # 只生成 C 源码（build/ 目录，可直接阅读）
 php tests/run.php                            # 跑测试（44 个用例，含多文件/内存/推断/phpc/可见性/闭包/heredoc/枚举/析构/指令安全/平台条件）
-php tests/shared.php                         # 库模式测试（--shared + #[export] 符号导出）
+php tests/shared.php                         # 库模式测试（shared 命令 + #[export] 符号导出）
+php tests/dot.php                            # `.` 指令测试（递归展开 + 排除规则）
 php tests/cross.php                          # 交叉编译测试（4 个目标）
 ```
 
@@ -77,9 +79,9 @@ php main.php main.php -os windows -arch i386  # → 32 位 Windows exe
 
 ```bash
 php main.php main.php --no-main              # 不生成 main()，只输出 C 源码
-php main.php main.php --shared               # 编译为 main.dll（Windows，当前目录）
-php main.php main.php --shared -os linux -arch arm64   # → main.so
-php main.php main.php --cc=gcc --cflag=-mcpu=cortex-m4 # gcc/clang 透传参数
+php main.php shared main.php            # 编译为 main.dll（Windows，当前目录）
+php main.php shared main.php -os linux -arch arm64   # → main.so
+php main.php shared main.php --cc gcc --cflag -mcpu=cortex-m4 # gcc/clang 透传参数
 ```
 
 库模式下用户函数与 `tphp_new_<Class>` 都是非 static 的 C 符号，

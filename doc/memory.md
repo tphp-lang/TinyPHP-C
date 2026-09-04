@@ -52,7 +52,7 @@ TinyPHP 的内存安全分三层：**安全核心**（纯 TinyPHP 代码，构�
 ### 可验证性
 
 ```console
-$ php main.php app.php --run --mem-stats
+$ php main.php run app.php --mem-stats
 ...程序输出...
 mem: arrays 17/17 objects 15/15 leaks=0
 ```
